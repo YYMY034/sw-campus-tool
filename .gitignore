@@ -1,0 +1,20 @@
+# 运行期生成的本地文件（含登录态 / 设备指纹，切勿提交）
+session.json
+identity.json
+device_bind.json
+devices.json
+active_device.txt
+points_cache.json
+campus.json
+MasterSwitch.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 日志与临时文件
+*.log
+*.tmp

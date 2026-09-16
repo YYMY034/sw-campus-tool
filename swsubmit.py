@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+swsubmit.py — 运动世界校园 · 跑步记录提交模块
+
+复刻 Android 端 POST /api/v70260/runnings/save/record 的完整请求：
+  · runes 头 = policy_ts + uid
+  · runef 头 = run_uuid + start_ms
+  · body 31+ 字段 + signature / originalSign
+  · speedPerTenSec / stepsPerTenSec 10 秒窗
+  · 三层信封加密
+
+用法（被 swcli.py submit 子命令调用）：
+    python swsubmit.py --track generator/output/xxx.json --dry-run
+    python swsubmit.py --track generator/output/xxx.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import swclient as sw
+
+RECORD_PATH = "/api/v70260/runnings/save/record"
+POLICY_PATH = "/api/v70103/runModePolicy"
+SIGN_SALT = "2slhe02lsfiwowlcixisla_sls-_slaor"
+
+# UploadSignEntity 声明顺序（31 字段）
+UPLOAD_SIGN_FIELD_ORDER = [
+    "sportType", "totalTime", "totalDis", "speed", "startTime", "stopTime",
+    "complete", "selDistance", "unCompleteReason", "getPrize", "status",
+    "uuid", "uid", "avgStepFreq", "totalSteps", "selectedUnid", "calorie",
+    "policy", "selRunTime", "validDis", "validTime", "useMobilityTools",
+    "errorCode", "geeToken", "unauthorized", "themeId", "faceCheck",
+    "goalId", "address", "avgPower", "totalAscent",
+]
+
+
+# ══════════════════════════════════════════════════════════════════
+# 签名（Java String.valueOf 语义）
+# ══════════════════════════════════════════════════════════════════
+def _android_value(v):
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return v
+    if isinstance(v, float):
+        # Java String.valueOf(double)：整数显示为 x.0
+        if v == int(v) and abs(v) < 1e15:
+            return "%.1f" % v
+        return repr(v)
+    return str(v)
+
+
+def _build_sign_map(values: dict, has_room_id: bool = False):
+    m = []
+    for k in UPLOAD_SIGN_FIELD_ORDER:
+        if k in values:
+            m.append((k, _android_value(values[k])))
+    if has_room_id and "roomId" in values:
+        m.append(("roomId", _android_value(values["roomId"])))
+    return [(k, v) for (k, v) in m if k.lower() != "signature"]
+
+
+def original_sign(values: dict, has_room_id: bool = False) -> str:
+    m = _build_sign_map(values, has_room_id)
+    m.sort(key=lambda kv: kv[0])                       # 自然序
+    return "&".join("%s=%s" % (k, v) for k, v in m)
+
+
+def signature(values: dict, has_room_id: bool = False) -> str:
+    m = _build_sign_map(values, has_room_id)
+    m.sort(key=lambda kv: kv[0].lower())                # compareToIgnoreCase
+    q = "&".join("%s=%s" % (k, v) for k, v in m)
+    return sw.md5_hex((q + SIGN_SALT).encode("utf-8"))
+
+
+# ══════════════════════════════════════════════════════════════════
+# 数值公式
+# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# 五点（服务端打卡点 → 提交 body 的 fivePointJson wrapper 串）
+# ══════════════════════════════════════════════════════════════════
+def five_point_payload(points: list, start_ms: int) -> list:
+    """五点实体（跑完态 isPass=true）。
+
+    与参考工具 wire.rs 一致：
+      · glat/glon 优先用服务端下发的 GCJ 坐标（存在时），否则用 lat/lon 转；
+      · pointName/isFixed/radius 原样带；
+      · position 固定 999（跑完态不在途）。
+    """
+    out = []
+    for i, p in enumerate(points):
+        lat = float(p.get("lat", 0) or 0)
+        lon = float(p.get("lon", 0) or 0)
+        glat = float(p.get("glat", p.get("gLat", 0)) or 0)
+        glon = float(p.get("glon", p.get("gLng", 0)) or 0)
+        if not (glat or glon) and (lat or lon):
+            # 无服务端 GCJ 坐标时本地转一次（WGS-84 → GCJ-02）
+            try:
+                import swobs
+                glat, glon = swobs.wgs84_to_gcj02(lat, lon)
+            except Exception:
+                glat, glon = lat, lon
+        out.append({
+            "flag": start_ms,
+            "glat": round_to(glat, 7),
+            "glon": round_to(glon, 7),
+            "id": i + 1,
+            "isFixed": int(p.get("isFixed", 0) or 0),
+            "isPass": True,
+            "lat": round_to(lat, 7),
+            "lon": round_to(lon, 7),
+            "pointName": p.get("pointName", "") or "",
+            "position": 999,
+            "radius": float(p.get("radius", 0) or 0),
+            "state": 0,
+        })
+    return out
+
+
+def five_point_wrapper(points: list, start_ms: int) -> str:
+    """提交 body 的 fivePointJson 包装串（计分跑用）。
+
+    仅当 mode=score 且有真实打卡点时调用；自由跑【不传】此字段
+    （用户真机确认：自由跑无围栏、无打卡点）。
+    """
+    five = five_point_payload(points, start_ms)
+    return json.dumps({
+        "useZip": False,
+        "fivePointJson": json.dumps(five, separators=(",", ":"),
+                                    ensure_ascii=False),
+        "runAreaId": -1,
+        "geoFencesJson": "[]",
+        "freedomShowFence": False,
+    }, separators=(",", ":"), ensure_ascii=False)
+
+
+def round_to(v: float, nd: int) -> float:
+    """Rust/Java 风格四舍五入（half-up on abs）"""
+    f = 10.0 ** nd
+    return math.floor(abs(v) * f + 0.5) / f * (1 if v >= 0 else -1)
+
+
+def avg_power(weight: float, total_dis: float, total_time: int) -> int:
+    """平均功率（瓦）近似：官方口径 w = 体重 * 距离(m) / 时间(s) 的功率换算"""
+    if total_time <= 0:
+        return 0
+    # 参照 NekoSportsWorldTool/src/track/calorie.rs 口径
+    speed = total_dis / total_time
+    if speed <= 0:
+        return 0
+    # MET 近似：功率 = 体重 * v * 1.0（走路/跑步转化）
+    return int(round_to(weight * speed * 0.98, 0))
+
+
+def official_kcal(weight: float, total_time: int, total_dis: float) -> int:
+    """官方卡路里口径（kJ→kcal），参照 calorie.rs"""
+    if total_time <= 0 or weight <= 0:
+        return 0
+    speed = total_dis / total_time
+    # 简化 MET：跑步 1.05 kcal/kg/km
+    km = total_dis / 1000.0
+    return int(round_to(weight * km * 1.036, 0))
+
+
+def android_tensec(points: list, start_ms: int, total_time: int, kind: str,
+                   rrid: int = 0) -> list:
+    """10 秒窗 speedPerTenSec / stepsPerTenSec。
+
+    ★ id 规则（新版 App）：
+        id = (rrid % 100000) * 1000 + 窗口右边界秒数
+      旧版用全局序号 60000+n，服务端不报错但详情页轨迹会异常。
+    """
+    out = []
+    seed = ((rrid % 100000) * 1000) if rrid else 60000
+    w = 10
+    while w <= total_time:
+        lo, hi = w - 10, min(w, total_time)
+        d_lo = s_lo = 0.0
+        d_hi = s_hi = 0.0
+        for p in points:
+            tt = p.get("t_rel", p.get("ts", 0))
+            if tt <= lo:
+                d_lo = p.get("dist", 0.0)
+                s_lo = p.get("steps", 0.0)
+            if tt <= hi:
+                d_hi = p.get("dist", 0.0)
+                s_hi = p.get("steps", 0.0)
+        dist = round_to(max(d_hi - d_lo, 0.0), 4)
+        steps_n = int(max(s_hi - s_lo, 0))
+        # 距离用实际轨迹长度更稳（窗口插值在点数稀疏时会截断）
+        begin = start_ms + lo * 1000
+        end = start_ms + hi * 1000
+        qn = w // 10 - 1
+        win_id = seed + hi
+        if kind == "speed":
+            out.append({"beginTime": begin, "distance": dist, "endTime": end,
+                        "flag": start_ms, "id": win_id, "queueNum": qn,
+                        "state": 0})
+        else:
+            out.append({"avgDiff": 0.0, "beginTime": begin, "endTime": end,
+                        "flag": start_ms, "id": win_id, "maxDiff": 0.0,
+                        "minDiff": 1000.0, "queueNum": qn, "state": 0,
+                        "stepsNum": steps_n})
+        w += 10
+    return out
+
+
+def window_distance_sum(points: list, total_time: int) -> float:
+    """10 秒窗距离累计（与 android_tensec 同口径，用于自洽校验）"""
+    tot = 0.0
+    w = 10
+    while w <= total_time:
+        lo, hi = w - 10, min(w, total_time)
+        d_lo = d_hi = 0.0
+        for p in points:
+            tt = p.get("t_rel", p.get("ts", 0))
+            if tt <= lo:
+                d_lo = p.get("dist", 0.0)
+            if tt <= hi:
+                d_hi = p.get("dist", 0.0)
+        tot += max(d_hi - d_lo, 0.0)
+        w += 10
+    return tot
+
+
+# ══════════════════════════════════════════════════════════════════
+# 轨迹 → 提交点（补 ts 相对秒与累计步数）
+# ══════════════════════════════════════════════════════════════════
+def prep_points(track: dict) -> tuple:
+    """把生成器输出转成提交所需的点位。
+
+    返回 (points, total_dis, total_time, total_steps, start_ms)
+    生成器 points 字段：i, ts, lat, lon, ele, speed, cadence, stride_cm, hr, dist, seg_m
+    """
+    pts = track.get("points") or []
+    if not pts:
+        raise ValueError("轨迹无 points 数据")
+    start_ms = int(pts[0]["ts"])
+    norm = []
+    for p in pts:
+        t_rel = (int(p["ts"]) - start_ms) / 1000.0
+        cadence = float(p.get("cadence", 0) or 0)
+        q = dict(p)
+        q["t_rel"] = t_rel
+        q["lat"] = float(p.get("lat", 0))
+        q["lon"] = float(p.get("lon", 0))
+        q["dist"] = float(p.get("dist", 0))
+        q["ele"] = float(p.get("ele", 0) or 0)
+        # 累计步数：用 cadence(步/分) × 时间步长积分近似
+        q["_cadence"] = cadence
+        norm.append(q)
+
+    # 累计步数积分（梯形法）
+    total_steps = 0.0
+    for i, q in enumerate(norm):
+        if i == 0:
+            q["steps"] = 0.0
+            continue
+        dt = q["t_rel"] - norm[i - 1]["t_rel"]
+        total_steps += (norm[i - 1]["_cadence"] + q["_cadence"]) / 2.0 / 60.0 * dt
+        q["steps"] = total_steps
+
+    last = norm[-1]
+    total_dis = float(last["dist"])
+    total_time = int(round(last["t_rel"]))
+    return norm, total_dis, total_time, int(round(total_steps)), start_ms
+
+
+def total_ascent(points: list) -> float:
+    asc = 0.0
+    for i in range(1, len(points)):
+        d = points[i].get("ele", 0) - points[i - 1].get("ele", 0)
+        if d > 0:
+            asc += d
+    return asc
+
+
+# ══════════════════════════════════════════════════════════════════
+# 组装提交体
+# ══════════════════════════════════════════════════════════════════
+def build_record_body(track: dict, *, uid: int, unid: int, policy: int,
+                      policy_ts: int, min_distance: int, weight: float = 65.0,
+                      face_check: int = 0, address: str = "",
+                      five_point_json: str = "", sport_type: int = 1,
+                      with_steps: bool = True, rrid: int = 0) -> dict:
+    """组装提交体。
+
+    with_steps：恒为 True（自由跑与计分跑【都要】完整步频步幅图表，
+    这是给详情页 步频/步幅 图表用的数据源）。历史 False 分支已废弃。
+    """
+    points, total_dis, total_time, total_steps_raw, start_ms = prep_points(track)
+    stop_ms = start_ms + total_time * 1000
+    ascent = total_ascent(points)
+
+    # ★ 先生成 10 秒窗，再让 totalSteps / totalDis 与窗口严格自洽。
+    #   服务端常见校验：sum(stepsPerTenSec) == totalSteps。
+    sp_ten = android_tensec(points, start_ms, total_time, "speed", rrid=rrid)
+    st_ten = android_tensec(points, start_ms, total_time, "steps", rrid=rrid)
+    win_dis = sum(x["distance"] for x in sp_ten)
+    win_steps = sum(x["stepsNum"] for x in st_ten)
+
+    # 距离：窗口累计与轨迹总距离取整后应对齐；
+    # 若窗口插值截断（点稀疏），以轨迹真实距离为准。
+    total_dis_i = int(round_to(max(win_dis, total_dis), 0))
+    total_steps = int(win_steps) if win_steps > 0 else total_steps_raw
+
+    # 步频步幅：自由跑与计分跑都要上传（详情页图表依赖），恒带
+    total_steps = int(win_steps) if win_steps > 0 else total_steps_raw
+
+    power = avg_power(weight, total_dis_i, total_time)
+    kcal = official_kcal(weight, total_time, total_dis_i)
+
+    run_uuid = str(uuid.uuid4()).upper()
+    dis_ceil = math.ceil(total_dis_i * 100.0) / 100.0
+    speed = int(round_to(total_time / dis_ceil * 50.0 / 3.0, 2) * 1024.0) if dis_ceil else 0
+    avg_step_freq = max(1, int(round_to(total_steps / total_time * 60.0, 0))) if (total_time and total_steps) else 0
+
+    body = {
+        "allLocJson": "",
+        "sportType": sport_type,
+        "policy": policy,
+        "totalTime": total_time,
+        "startTime": start_ms,
+        "stopTime": stop_ms,
+        "getPrize": False,
+        "status": 0,
+        "uuid": run_uuid,
+        "uid": uid,
+        "selectedUnid": unid,
+        "selRunTime": total_time,
+        "selDistance": min_distance,
+        "totalDis": total_dis_i,
+        "speed": speed,
+        "validDis": total_dis_i,
+        "validTime": total_time,
+        "complete": True,
+        "unCompleteReason": 0,
+        "calorie": kcal,
+        "useMobilityTools": 0,
+        "faceCheck": face_check,
+        "totalAscent": int(round_to(ascent, 0)),
+        "avgPower": power,
+        "speedPerTenSec": sp_ten,
+        "isUpload": False,
+        "more": False,
+        "latitude": 0.0,
+        "longitude": 0.0,
+        "maxRunTime": 0,
+        "minSteps": 0,
+        "errorCode": 0,
+        "geeToken": "",
+        "unauthorized": 0,
+        "themeId": 0,
+        "goalId": None,
+        "address": address,
+    }
+    if five_point_json:
+        body["fivePointJson"] = five_point_json
+    # 步频步幅恒带（自由跑/计分跑都需完整图表数据）
+    body["totalSteps"] = total_steps
+    body["avgStepFreq"] = avg_step_freq
+    body["stepsPerTenSec"] = st_ten
+
+    body["signature"] = signature(body, False)
+    body["originalSign"] = original_sign(body, False)
+    meta = {"uuid": run_uuid, "start_ms": start_ms, "total_dis": total_dis_i,
+            "total_time": total_time, "total_steps": total_steps,
+            "avg_step_freq": avg_step_freq, "speed": speed, "calorie": kcal,
+            "avg_power": power, "ascent": ascent, "sport_type": sport_type,
+            "with_steps": with_steps,
+            "win_dis_sum": win_dis, "win_steps_sum": win_steps,
+            "points": points}
+    return body, meta
+
+
+# ══════════════════════════════════════════════════════════════════
+# 本地自检（签名测试向量）
+# ══════════════════════════════════════════════════════════════════
+def selftest() -> bool:
+    sample = {
+        "sportType": 3, "totalTime": 1000, "totalDis": 1200, "speed": 1200,
+        "startTime": 1700000000000, "stopTime": 1700000001000,
+        "complete": True, "selDistance": 1500, "unCompleteReason": 0,
+        "getPrize": False, "status": 1, "uuid": "test-uuid", "uid": 13056447,
+        "avgStepFreq": 134, "totalSteps": 1000, "selectedUnid": 57501,
+        "calorie": 0, "policy": 0, "selRunTime": 0, "validDis": 1100,
+        "validTime": 900, "useMobilityTools": 0, "errorCode": 0,
+        "geeToken": "", "unauthorized": 0, "themeId": 0, "faceCheck": 1,
+        "goalId": None, "address": "", "avgPower": 0, "totalAscent": 0,
+        "roomId": 1001,
+    }
+    ok = True
+    s1 = signature(sample, True)
+    exp1 = "f2b958b2b9c8e99c4156076fbc72aabe"
+    print("  %s signature(含 roomId) = %s (期望 %s)" % ("OK " if s1 == exp1 else "FAIL", s1, exp1))
+    ok &= s1 == exp1
+
+    s2 = signature(sample, False)
+    exp2 = "6187185669bbd60d0c9ff4148f33e16d"
+    print("  %s signature(不含 roomId) = %s (期望 %s)" % ("OK " if s2 == exp2 else "FAIL", s2, exp2))
+    ok &= s2 == exp2
+
+    o1 = original_sign(sample, True)
+    pref = "address=&avgPower=0&avgStepFreq=134&calorie=0&complete=true&errorCode=0&faceChec"
+    print("  %s originalSign 前缀" % ("OK " if o1.startswith(pref) else "FAIL"))
+    ok &= o1.startswith(pref)
+    print("  %s originalSign 含 goalId=null" % ("OK " if "goalId=null" in o1 else "FAIL"))
+    ok &= "goalId=null" in o1
+    return ok
+
+
+def main():
+    ap = argparse.ArgumentParser(description="跑步记录提交")
+    ap.add_argument("--track", help="轨迹 JSON（生成器输出）")
+    ap.add_argument("--selftest", action="store_true", help="只跑签名自检")
+    ap.add_argument("--dry-run", action="store_true", help="只构造不发送")
+    args = ap.parse_args()
+
+    if args.selftest:
+        print("=" * 60)
+        print("swsubmit 签名自检")
+        print("=" * 60)
+        ok = selftest()
+        print("=" * 60)
+        print("汇总: %s" % ("全部通过" if ok else "存在失败"))
+        return 0 if ok else 1
+
+    if not args.track:
+        ap.print_help()
+        return 1
+    track = json.load(open(args.track, encoding="utf-8"))
+    body, meta = build_record_body(track, uid=12345678, unid=3305, policy=1,
+                                   policy_ts=1789535218913, min_distance=2000)
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+    if args.dry_run:
+        print("[dry-run] body 长度 %d 字节" % len(json.dumps(body)))
+        print(json.dumps({k: v for k, v in body.items()
+                          if not isinstance(v, list)}, ensure_ascii=False, indent=2)[:1500])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

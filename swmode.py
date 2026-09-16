@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+swmode.py — 运动世界校园 · 跑步「双模式」核心
+
+校方有两种跑步模式：
+
+  free  —— 自由跑
+      · 只要在【学校范围内】即可
+      · 【不需要】经过打卡点
+      · 可被计分（服务端按 reasonList 4 条规则自动判定）
+      · 轨迹：以校区坐标为圆心的环形绕圈
+
+  score —— 计分跑
+      · 【必须】经过服务端下发的打卡点（isFixed=1 为必经点）
+      · 轨迹：把打卡点串成闭环，多圈重复直到达到目标距离
+      · 若打卡点与用户所在校区距离过远（不可达），警告并建议改用 free
+
+本模块只负责：
+  1) 拉取 / 缓存打卡点（规避 5 分钟 3 次限流）
+  2) 可达性判定
+  3) 调生成器造轨迹
+返回轨迹 JSON 路径，供 swcli.py submit 使用。
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+POINTS_CACHE = os.path.join(HERE, "points_cache.json")
+POINTS_CACHE_TTL = 30 * 60          # 打卡点缓存 30 分钟（限流 5 分钟 3 次）
+REACHABLE_KM = 10.0                 # 超过 10km 判定为"不可达"
+
+EARTH_R = 6371000.0
+
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    """两点球面距离（米）"""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_R * math.asin(math.sqrt(a))
+
+
+# ══════════════════════════════════════════════════════════════════
+# 打卡点：拉取 + 缓存 + 可达性
+# ══════════════════════════════════════════════════════════════════
+def load_cache(force: bool = False, anchor=None):
+    """读取打卡点缓存；anchor=(lat,lon) 用于校验缓存锚点与当前校区一致。
+
+    若 anchor 与缓存记录的锚点不一致（换校区/坐标变了），视作缓存失效，
+    强制重新拉取，避免用错学校的打卡点。
+    """
+    if force or not os.path.exists(POINTS_CACHE):
+        return None
+    try:
+        obj = json.load(open(POINTS_CACHE, encoding="utf-8"))
+    except Exception:
+        return None
+    if time.time() - float(obj.get("_ts", 0)) > POINTS_CACHE_TTL:
+        return None
+    if anchor is not None:
+        ca = obj.get("anchor")
+        if ca is None or (abs(float(ca[0]) - float(anchor[0])) > 1e-5 or
+                          abs(float(ca[1]) - float(anchor[1])) > 1e-5):
+            # 缓存锚点与当前校区不一致 → 缓存作废
+            return None
+    return obj.get("points") or []
+
+
+def save_cache(points: list, anchor=None):
+    obj = {"_ts": time.time(), "points": points}
+    if anchor is not None:
+        obj["anchor"] = [float(anchor[0]), float(anchor[1])]
+    json.dump(obj, open(POINTS_CACHE, "w", encoding="utf-8"),
+              ensure_ascii=False, indent=2)
+
+
+def is_ratelimit(err: str) -> bool:
+    return "10603" in (err or "")
+
+
+def get_points(c, lat: float, lon: float, unid: int, *,
+               force: bool = False, verbose: bool = True):
+    """返回 (points, source)。source ∈ {"cache","remote","rate-limited"}"""
+    anchor = (lat, lon) if (lat is not None and lon is not None) else None
+    pts = load_cache(force, anchor=anchor)
+    if pts:
+        if verbose:
+            print("  [cache] 复用打卡点缓存 %d 个（30 分钟内有效，锚点一致）" % len(pts))
+        return pts, "cache"
+
+    import fetch_points as fp
+    if verbose:
+        print("--- 拉取打卡点 /api/v560/get/1/distance/1 ---")
+    biz, raw_pts, err = fp.fetch_points(c, lat, lon, unid, verbose=verbose)
+    if biz is None:
+        if is_ratelimit(err):
+            if verbose:
+                print("  [限流] 10603：5 分钟内最多 3 次，请稍后再试")
+            pts = load_cache(force=True, anchor=anchor)
+            return (pts or []), "rate-limited"
+        return [], "error"
+
+    # 归一化：服务端把点位放在 pointsResModels
+    d = biz.get("data") or {}
+    if isinstance(d, dict):
+        cand = d.get("pointsResModels") or d.get("list") or []
+    elif isinstance(d, list):
+        cand = d
+    else:
+        cand = raw_pts or []
+
+    pts = []
+    for p in cand:
+        try:
+            pts.append({
+                "pointName": p.get("pointName") or ("点位%d" % (len(pts) + 1)),
+                "lat": float(p.get("lat")),
+                "lon": float(p.get("lon")),
+                "glat": float(p.get("glat", p.get("lat"))),
+                "glon": float(p.get("glon", p.get("lon"))),
+                "radius": float(p.get("radius") or 15),
+                "isFixed": int(p.get("isFixed") or 0),
+            })
+        except (TypeError, ValueError):
+            continue
+    if pts:
+        save_cache(pts, anchor=anchor)
+        if verbose:
+            print("  [OK] 打卡点 %d 个（必经 %d 个）"
+                  % (len(pts), sum(1 for x in pts if x["isFixed"] == 1)))
+    return pts, "remote"
+
+
+def reachability(points: list, campus_lat: float, campus_lon: float):
+    """返回 (可达? , 最近距离km, 最远距离km)。无可达性结论时返回 None"""
+    if not points:
+        return None, None, None
+    ds = [haversine(campus_lat, campus_lon, p["lat"], p["lon"]) / 1000.0
+          for p in points]
+    near, far = min(ds), max(ds)
+    return (far <= REACHABLE_KM), near, far
+
+
+def fixed_points(points: list) -> list:
+    """必经点（isFixed=1）。用于【校验】必须命中。"""
+    fx = [p for p in points if p["isFixed"] == 1]
+    return fx or points
+
+
+def route_points(points: list) -> list:
+    """用于【串路线】的点：优先用全部点位（构成一圈完整跑道）。
+
+    打卡点是校方在同一场地布设的多个点，全部串起来才是一圈完整闭环；
+    只串必经点会让闭环退化成一个点。
+    """
+    return list(points) if len(points) > 1 else fixed_points(points)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 轨迹生成
+# ══════════════════════════════════════════════════════════════════
+def _gen_cmd():
+    return [sys.executable, os.path.join(HERE, "generator", "run_gen.py")]
+
+
+def _fmt_start(dt=None) -> str:
+    """默认开始时间：5 分钟前（留出提交+上传耗时，避免 stopTime 落在未来）"""
+    if dt is None:
+        t = time.localtime(time.time() - 300)
+    else:
+        t = dt
+    return time.strftime("%Y-%m-%d %H:%M:%S", t)
+
+
+def gen_free_track(campus_lat: float, campus_lon: float, dist_km: float,
+                   *, start: str = None, pace: str = "5:40",
+                   cadence: int = 0, seed: int = 0, outdir: str = None,
+                   verbose: bool = True) -> str:
+    """自由跑：以校区坐标为中心的环形绕圈（不带打卡点）"""
+    outdir = outdir or os.path.join(HERE, "generator", "output")
+    cmd = _gen_cmd() + [
+        "--dist", "%.2f" % dist_km,
+        "--start", start or _fmt_start(),
+        "--lat", "%.6f" % campus_lat,
+        "--lon", "%.6f" % campus_lon,
+        "--mode", "loop",
+        "--pace", pace,
+        "--outdir", outdir,
+    ]
+    if cadence:
+        cmd += ["--cadence", str(cadence)]
+    if seed:
+        cmd += ["--seed", str(seed)]
+    if verbose:
+        print("  [生成] 自由跑 环形 %.2fkm @ 校区(%.6f, %.6f)"
+              % (dist_km, campus_lat, campus_lon))
+    return _run_gen(cmd, outdir, verbose)
+
+
+def gen_score_track(points: list, dist_km: float, *,
+                    start: str = None, pace: str = "5:40",
+                    cadence: int = 0, seed: int = 0, outdir: str = None,
+                    verbose: bool = True) -> str:
+    """计分跑：把打卡点串成闭环，多圈重复至目标距离"""
+    use = route_points(points)
+    if not use:
+        raise ValueError("计分跑需要打卡点，但点位列表为空")
+    outdir = outdir or os.path.join(HERE, "generator", "output")
+    anchor = use[0]
+    cmd = _gen_cmd() + [
+        "--dist", "%.2f" % dist_km,
+        "--start", start or _fmt_start(),
+        "--lat", "%.6f" % anchor["lat"],
+        "--lon", "%.6f" % anchor["lon"],
+        "--mode", "loop",
+        "--pace", pace,
+        "--outdir", outdir,
+    ]
+    for p in use:
+        cmd += ["--cp", "%s:%.6f:%.6f:%g"
+                % (p["pointName"], p["lat"], p["lon"], p["radius"])]
+    if cadence:
+        cmd += ["--cadence", str(cadence)]
+    if seed:
+        cmd += ["--seed", str(seed)]
+    if verbose:
+        print("  [生成] 计分跑 过 %d 个打卡点 环形 %.2fkm" % (len(use), dist_km))
+        for p in use:
+            print("         · %s (%.6f, %.6f) r=%gm%s"
+                  % (p["pointName"], p["lat"], p["lon"], p["radius"],
+                     "  [必经]" if p["isFixed"] == 1 else ""))
+    return _run_gen(cmd, outdir, verbose)
+
+
+def _run_gen(cmd: list, outdir: str, verbose: bool) -> str:
+    """跑生成器并返回产出的轨迹 JSON 路径。
+
+    ★ 生成器会打印 "✓ JSON  <abs path>"，从这里解析最新的产出路径，
+      不依赖「文件新增」或 mtime（同名文件会被覆盖，mtime 不可靠）。
+    """
+    os.makedirs(outdir, exist_ok=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError("生成器失败(%d):\n%s\n%s"
+                           % (r.returncode, r.stdout[-1500:], r.stderr[-1500:]))
+    # 从 stdout 抓 "✓ JSON  <abs>"
+    import re
+    for line in (r.stdout or "").splitlines():
+        if "JSON" in line and (".json" in line.lower()):
+            m = re.search(r"(\S+\.json)\s*$", line.strip())
+            if m:
+                p = m.group(1)
+                if not os.path.isabs(p):
+                    p = os.path.join(outdir, p)
+                if os.path.exists(p):
+                    if verbose:
+                        try:
+                            t = json.load(open(p, encoding="utf-8"))
+                            mm = t.get("metrics") or {}
+                            print("  [OK] %s  距离=%.2fkm 用时=%ds 点=%d"
+                                  % (os.path.basename(p),
+                                     float(mm.get("distance_m") or 0) / 1000.0,
+                                     int(float(mm.get("duration_s") or 0)),
+                                     len(t.get("points") or [])))
+                        except Exception:
+                            print("  [OK] %s" % os.path.basename(p))
+                    return p
+    raise RuntimeError("生成器未产出 JSON：\n%s" % r.stdout[-1500:])
+
+
+# ══════════════════════════════════════════════════════════════════
+# 轨迹校验：必过打卡点 + 首末闭合
+# ══════════════════════════════════════════════════════════════════
+def verify_track(path: str, points: list = None, verbose: bool = True) -> dict:
+    """校验轨迹是否经过全部【必经点】、是否闭合。"""
+    t = json.load(open(path, encoding="utf-8"))
+    pts = t.get("points") or []
+    rep = {"points": len(pts), "hits": [], "closed": False,
+           "closed_gap_m": None, "ok": False}
+    if pts:
+        rep["closed_gap_m"] = haversine(pts[0]["lat"], pts[0]["lon"],
+                                        pts[-1]["lat"], pts[-1]["lon"])
+        # GPS 精度内（<5m）即视为闭合 —— 真实跑步起点终点本就允许几米漂移，
+        # 服务端按 isValidPoint 判速/步幅，不校验首末完全重合。
+        rep["closed"] = rep["closed_gap_m"] < 5.0
+    if points:
+        need = fixed_points(points)          # 只强制校验必经点
+        allok = True
+        for p in need:
+            d = min(haversine(p["lat"], p["lon"], q["lat"], q["lon"])
+                    for q in pts) if pts else 1e9
+            hit = d <= max(p["radius"], 20)
+            allok &= hit
+            rep["hits"].append({"name": p["pointName"], "dist_m": round(d, 2),
+                                "hit": hit})
+        rep["ok"] = allok and rep["closed"]
+    else:
+        rep["ok"] = rep["closed"]
+    if verbose:
+        for h in rep["hits"]:
+            print("      %s %s  距点 %.1fm"
+                  % ("OK " if h["hit"] else "MISS", h["name"], h["dist_m"]))
+        print("      闭合: %s (首末相距 %s m)"
+              % ("是" if rep["closed"] else "否",
+                 "%.1f" % rep["closed_gap_m"] if rep["closed_gap_m"] is not None else "-"))
+    return rep
+
+
+# ══════════════════════════════════════════════════════════════════
+# 统一入口
+# ══════════════════════════════════════════════════════════════════
+def prepare(c, mode: str, dist_km: float, *, campus_lat: float = None,
+            campus_lon: float = None, unid: int = 0, start: str = None,
+            pace: str = "5:40", cadence: int = 0, seed: int = 0,
+            outdir: str = None, force_points: bool = False,
+            verbose: bool = True) -> dict:
+    """按模式准备轨迹。
+
+    返回 {"mode","track","points","tracks_left","warn"}
+    """
+    mode = (mode or "free").lower()
+    if mode not in ("free", "score"):
+        raise ValueError("mode 必须是 free 或 score")
+
+    campus_lat = campus_lat if campus_lat is not None else getattr(c, "campus_lat", None)
+    campus_lon = campus_lon if campus_lon is not None else getattr(c, "campus_lon", None)
+    res = {"mode": mode, "track": None, "points": [], "warn": None}
+
+    if mode == "free":
+        if campus_lat is None or campus_lon is None:
+            raise ValueError("自由跑需要校区坐标 --campus-lat/--campus-lon")
+        if verbose:
+            print("--- 模式: 自由跑（校园范围内，无需打卡点）---")
+        res["track"] = gen_free_track(campus_lat, campus_lon, dist_km,
+                                      start=start, pace=pace,
+                                      cadence=cadence, seed=seed,
+                                      outdir=outdir, verbose=verbose)
+        if verbose:
+            print("  [校验] 闭合性")
+        verify_track(res["track"], None, verbose=verbose)
+        return res
+
+    # ── score ──────────────────────────────────────────────
+    if verbose:
+        print("--- 模式: 计分跑（必须经过打卡点）---")
+    pts, src = get_points(c, campus_lat, campus_lon, unid,
+                          force=force_points, verbose=verbose)
+    if not pts:
+        raise RuntimeError("未能获取打卡点（限流或接口异常），请改用 --mode free")
+
+    if campus_lat is not None and campus_lon is not None:
+        ok, near, far = reachability(pts, campus_lat, campus_lon)
+        if verbose:
+            print("  [可达性] 最近 %.2fkm 最远 %.2fkm  (阈值 %.0fkm)"
+                  % (near, far, REACHABLE_KM))
+        if not ok:
+            msg = ("打卡点距校区 %.1fkm（最近 %.1fkm），明显不可达 —— "
+                   "计分跑无法完成，建议改用 --mode free" % (far, near))
+            res["warn"] = msg
+            if verbose:
+                print("  [!!] %s" % msg)
+    if src == "rate-limited":
+        res["warn"] = (res["warn"] or "") + " [打卡点接口限流，使用旧缓存]"
+
+    res["points"] = pts
+    res["track"] = gen_score_track(pts, dist_km, start=start, pace=pace,
+                                   cadence=cadence, seed=seed,
+                                   outdir=outdir, verbose=verbose)
+    if verbose:
+        print("  [校验] 必经点命中 & 闭合性")
+    rep = verify_track(res["track"], pts, verbose=verbose)
+    if not rep["ok"]:
+        res["warn"] = (res["warn"] or "") + " [轨迹未完全通过必经点/未闭合]"
+    return res
+
+
+def track_start_ms(path: str) -> int:
+    t = json.load(open(path, encoding="utf-8"))
+    pts = t.get("points") or []
+    return int(pts[0]["ts"]) if pts else 0
+
+
+if __name__ == "__main__":
+    import swcli
+    ap = __import__("argparse").ArgumentParser(description="双模式轨迹准备")
+    ap.add_argument("mode", choices=["free", "score"])
+    ap.add_argument("--dist", type=float, default=2.2)
+    ap.add_argument("--campus-lat", type=float, default=None)
+    ap.add_argument("--campus-lon", type=float, default=None)
+    ap.add_argument("--pace", default="5:40")
+    ap.add_argument("--force-points", action="store_true")
+    a = ap.parse_args()
+
+    cli = swcli.Client()
+    unid = int(cli.session.get("unid", 0) or 0)
+    import campus
+    if a.campus_lat is not None and a.campus_lon is not None:
+        lat, lon = float(a.campus_lat), float(a.campus_lon)
+    else:
+        camp = campus.pick_campus(cli, unid)
+        if camp.get("lat") is None or camp.get("lon") is None:
+            print("[ERR] 校区坐标未收录（%s）：请在 campus.json 手动校准，"
+                  "或传 --campus-lat --campus-lon" % camp.get("name", "?"))
+            sys.exit(1)
+        lat, lon = camp["lat"], camp["lon"]
+        unid = int(camp.get("unid") or unid or 0)
+    print("模式=%s 距离=%.2fkm 校区=(%.6f, %.6f) unid=%s"
+          % (a.mode, a.dist, lat, lon, unid))
+    out = prepare(cli, a.mode, a.dist, campus_lat=lat, campus_lon=lon,
+                  unid=unid, pace=a.pace, force_points=a.force_points)
+    print("-" * 60)
+    print("轨迹文件 : %s" % out["track"])
+    if out["warn"]:
+        print("警告     : %s" % out["warn"])
