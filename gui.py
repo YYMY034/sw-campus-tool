@@ -1370,7 +1370,7 @@ document.addEventListener("click",e=>{
   if(box&&!box.contains(e.target))closeDevDD();
 });
 
-/* 选中设备后：label 右侧显示认证型号（device_name，如 Xiaomi 22041216C） */
+/* 选中设备后：label 右侧显示认证型号（device_name，如 Xiaomi 22081212C） */
 async function showDevModel(){
   const name=$("rDevice").value;
   const el=$("devIdLbl");
