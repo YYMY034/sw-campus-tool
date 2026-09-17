@@ -947,7 +947,11 @@ def cmd_submit(args):
 
     # 1) 拉策略
     print("--- 拉取跑步策略 runModePolicy ---")
-    pbody = json.dumps({"runMode": 1, "ruleUpdateTime": 0,
+    # runMode 语义（实测 unid=3305）：1 → policy=1（计分/校园跑）；其余值 → policy=0
+    run_mode = getattr(args, "run_mode", None)
+    if run_mode is None:
+        run_mode = 1
+    pbody = json.dumps({"runMode": run_mode, "ruleUpdateTime": 0,
                         "geoFenceUpdateTime": 0, "selectUnid": unid,
                         "operateType": 0}, separators=(",", ":"))
     _, pbiz, perr, _ = c.call("POST", "/api/v70103/runModePolicy", pbody,
@@ -958,11 +962,14 @@ def cmd_submit(args):
     pd = pbiz.get("data") or {}
     rule = pd.get("runRuleModel") or {}
     policy = int(pd.get("policy") or 0)
+    # 允许命令行覆盖 policy（用于判定跑法判别字段）
+    if getattr(args, "policy", None) is not None:
+        policy = int(args.policy)
     policy_ts = int(pd.get("timestamp") or 0)
     min_distance = args.min_distance or int(rule.get("minDistance") or 2000)
     face_check = 1 if rule.get("faceVerify") else 0
-    print("  policy=%d policy_ts=%d minDistance=%d faceCheck=%d"
-          % (policy, policy_ts, min_distance, face_check))
+    print("  runMode=%s policy=%d policy_ts=%d minDistance=%d faceCheck=%d"
+          % (run_mode, policy, policy_ts, min_distance, face_check))
 
     # 2) 组装提交体
     print("--- 组装提交体 ---")
@@ -976,10 +983,18 @@ def cmd_submit(args):
             p["ts"] = int(p["ts"]) - shift
         print("  [护栏] 起点时间在未来/过近，整体前移 %.0f 秒" % (shift / 1000.0))
 
-    # ★ 模式 → sportType：自由跑=1、计分跑=5（App 端按此显示类型/是否需打卡点）。
-    #   无论是自由跑还是计分跑，都要带完整步频步幅（详情页图表数据源）。
+    # ★ 模式 → sportType（2026-09-17 真机实测确定，务必不要再猜）：
+    #     1 = 计分跑（校园跑，需点位核验、计入成绩）
+    #     4 = 自由跑（无需任何点位、不计入学期成绩，freedomRunCalculate=false）
+    #     6 = 户外跑（不计入成绩）
+    #   其余取值服务端一律拒绝：7+/9+ → 11517「跑步模式不对」；5 → 10106「uid不存在」。
+    #   实测证据：sportType=4 的记录在 App 运动记录列表显示「自由跑」；
+    #             =6 显示「户外跑」；=1 显示「计分跑」。
     is_score = (mode == "score")
-    sport_type = 5 if is_score else 1
+    sport_type = 1 if is_score else 4
+    # 允许命令行覆盖 sportType（用于判定「自由跑」对应的真实取值）
+    if getattr(args, "sport_type", None) is not None:
+        sport_type = int(args.sport_type)
     # 五点（真实打卡点）：仅计分跑传 fivePointJson；自由跑无围栏无打卡点 → 不传
     five_point_json = ""
     if is_score and prep.get("points"):
@@ -1143,6 +1158,12 @@ def build_parser():
     sp.add_argument("--no-obs", action="store_true",
                     help="跳过 OBS 轨迹上传（记录会显示默认位置）")
     sp.add_argument("--no-verify", action="store_true", help="跳过 OBS 回读校验")
+    sp.add_argument("--sport-type", type=int, default=None,
+                    help="覆盖 sportType（默认 free=1 / score=5）")
+    sp.add_argument("--policy", type=int, default=None,
+                    help="覆盖提交体 policy（默认取 runModePolicy 返回）")
+    sp.add_argument("--run-mode", type=int, default=None,
+                    help="runModePolicy 的 runMode（1=计分/校园跑；0=自由跑口径）")
     sp.set_defaults(func=cmd_submit)
     return p
 

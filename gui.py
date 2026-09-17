@@ -1163,7 +1163,8 @@ function toggleDay(d){
 /* ── 单次跑步详情弹窗 ── */
 function fmtDate(ms){const d=new Date(ms);const p=n=>String(n).padStart(2,"0");
   return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());}
-function sportName(t){t=Number(t);return t===5?"计分跑":(t===1?"自由跑":"运动");}
+// ★ 真机实测映射：1=计分跑、4=自由跑、6=户外跑
+function sportName(t){t=Number(t);return t===1?"计分跑":(t===4?"自由跑":(t===6?"户外跑":"未知"));}
 
 /* ── 使用说明弹窗 ── */
 function openHelp(){const m=$("helpMask");m.style.display="flex";}
@@ -1187,8 +1188,12 @@ function showDetail(rrid){
     const p=tSec/km;paceStr=Math.floor(p/60)+":"+String(Math.round(p%60)).padStart(2,"0");
   }
   const stf=r.avgStepFreq? r.avgStepFreq+" 步/分":"-";
-  const isScore=Number(r.sportType)===5;
-  const typeTxt=isScore?"计分跑":"自由跑";
+  // ★ sportType → 跑法（2026-09-17 真机实测）：1=计分跑(校园跑，需点位核验)、
+  //   4=自由跑(无点位、不计成绩)、6=户外跑；其余取值服务端拒绝。
+  const ST=Number(r.sportType);
+  const isScore=(ST===1);
+  const isFree=(ST===4);
+  const typeTxt=isScore?"计分跑":(isFree?"自由跑":(ST===6?"户外跑":"未知"));
   const typeCls=isScore?"score":"free";
   const endMs=r.stop_ms||(r.start_ms+(r.time||0)*1000);
   const span=(endMs-(r.start_ms||0))/1000;
