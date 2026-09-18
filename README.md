@@ -95,11 +95,10 @@ bash start.sh       # 自动打开浏览器；没开就手动访问 http://127.0
 
 遇到问题先跑 `bash check.sh`，会把环境信息一次性打印出来。
 
-> **登录依赖**：登录需要 `numpy` + `Pillow` 来识别滑块验证码缺口。若点「登录」没反应，
+> **登录说明**：登录需要 `numpy` + `Pillow` 来识别滑块验证码缺口。若点「登录」没反应，
 > 执行 `pkg install -y python-numpy python-pillow` 后重开控制台即可。
-> 也可以完全绕过登录 —— 把电脑上已登录的 `session.json`、`device_bind.json`、
-> `devices.json`、`active_device.txt` **这 4 个文件**一起拷进手机 `app/` 目录
-> （⚠️ 只拷 `session.json` 会因设备指纹不一致被风控拦截）。
+> 已在电脑上登录过的话，还可用**免登录方式**直接使用 —— 具体做法见压缩包内的
+> `手机使用说明.md`。涉及个人登录态，请自行妥善保管，勿外传。
 
 > 想阅读源码或二次开发？见 [GitHub 仓库](https://github.com/YYMY034/sw-campus-tool)。
 
