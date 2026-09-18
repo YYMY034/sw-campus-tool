@@ -120,19 +120,36 @@ def get_points(c, lat: float, lon: float, unid: int, *,
         cand = raw_pts or []
 
     pts = []
+    dropped = 0
     for p in cand:
         try:
+            # ★ 经度字段名以服务端/参考工具为准 = lon（不是 lng，lng 只用于 27 键轨迹点）。
+            #   lng 仅作防御性兜底：万一服务端改字段名，也不至于整批点位归零。
+            _lat = p.get("lat")
+            _lon = p.get("lon", p.get("lng"))
             pts.append({
                 "pointName": p.get("pointName") or ("点位%d" % (len(pts) + 1)),
-                "lat": float(p.get("lat")),
-                "lon": float(p.get("lon")),
-                "glat": float(p.get("glat", p.get("lat"))),
-                "glon": float(p.get("glon", p.get("lon"))),
+                "lat": float(_lat),
+                "lon": float(_lon),
+                "glat": float(p.get("glat", p.get("gLat", _lat))),
+                "glon": float(p.get("glon", p.get("gLng", _lon))),
                 "radius": float(p.get("radius") or 15),
                 "isFixed": int(p.get("isFixed") or 0),
             })
         except (TypeError, ValueError):
+            dropped += 1
             continue
+
+    # ★ 绝不静默丢点位：候选非空却一个都没解析出来 → 字段名漂移了。
+    #   若在这里默默返回 []，上层只会报「限流或接口异常」，把排查方向带偏，
+    #   而计分跑会退化成「无点位上传」——成绩无效却看不出原因。
+    if cand and not pts:
+        raise RuntimeError(
+            "打卡点解析失败：服务端返回 %d 个候选点，但字段名与预期不符"
+            "（需要 lat/lon）。首个候选点原文：%s"
+            % (len(cand), json.dumps(cand[0], ensure_ascii=False)[:200]))
+    if dropped and verbose:
+        print("  [警告] %d 个点位字段异常已跳过（解析成功 %d 个）" % (dropped, len(pts)))
     if pts:
         save_cache(pts, anchor=anchor)
         if verbose:
