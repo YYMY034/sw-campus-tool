@@ -336,9 +336,18 @@ def do_login(username: str, password: str) -> dict:
 
     log_write("登录 %s …（加载加密链 + checkGeeUse，设备=%s）"
               % (username, swcli.get_active_name() or "默认"))
-    ns = load_autologin()
+    def _dep_msg(e):
+        miss = getattr(e, "name", None) or str(e)
+        return ("缺少登录依赖 %s —— 请在 Termux 里执行："
+                "pkg install -y python-numpy python-pillow"
+                "（或重新运行 bash install.sh）" % miss)
+
     buf = io.StringIO()
     try:
+        # ★ load_autologin 必须在 try 内：它 exec 了 auto_login.py 的头部，
+        #   而那里有 `from PIL import Image` / `import numpy`。缺依赖时若在
+        #   try 外抛出，会冒泡成 HTTP 500，用户只看到"登录不上"却毫无线索。
+        ns = load_autologin()
         # 复用/分配该账号绑定的设备（首登固定一台，登录/提交都用它）
         ident = swcli.ensure_account_device(username)
         with contextlib.redirect_stdout(buf):
@@ -347,6 +356,10 @@ def do_login(username: str, password: str) -> dict:
             line = line.rstrip()
             if line:
                 log_write(line)
+    except ModuleNotFoundError as e:
+        msg = _dep_msg(e)
+        log_write(msg, "err")
+        return {"ok": False, "msg": msg}
     except Exception as e:
         log_write("登录异常：%s" % str(e)[:160], "err")
         return {"ok": False, "msg": "登录异常：%s" % str(e)[:160]}
