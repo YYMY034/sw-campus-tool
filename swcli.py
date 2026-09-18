@@ -1050,11 +1050,16 @@ def cmd_submit(args):
     print("--- OBS 轨迹上传 ---")
     # ★ 用完整轨迹点（含 lat/lon/ts/dist），并把 10 秒窗 id 与 rrid 对齐
     pts = meta["points"]
+    # ★★ 五点（fixed_point_json）只取【学校下发的打卡点】，绝不用轨迹点：
+    #    自由跑无围栏无打卡点 → []（fivePointJson="[]"）；计分跑 → 学校点位。
+    obs_cps = (prep.get("points") or []) if is_score else []
+    print("  [五点] %s → %d 个打卡点"
+          % ("计分跑" if is_score else "自由跑（无点位）", len(obs_cps)))
     try:
         obs_ok, keys = swobs.upload_track(
             c.call, pts, rrid=int(rrid), uuid=meta["uuid"], uid=c.uid,
             start_ms=meta["start_ms"], total_time=meta["total_time"],
-            with_steps=True)
+            with_steps=True, fixed_points=obs_cps)
     except Exception as e:
         print("[ERR] OBS 上传异常: %s" % e)
         return 4

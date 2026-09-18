@@ -244,25 +244,23 @@ def build_laps(points: list, start_ms: int) -> list:
 
 
 def five_point_payload(points: list, start_ms: int) -> list:
-    """五点实体（跑完态 isPass=true）"""
-    out = []
-    for i, p in enumerate(points):
-        lat, lng = float(p.get("lat", 0) or 0), float(p.get("lon", 0) or 0)
-        glat, glng = wgs84_to_gcj02(lat, lng) if (lat or lng) else (0.0, 0.0)
-        out.append({
-            "flag": start_ms,
-            "glat": round_to(glat, 7),
-            "glon": round_to(glng, 7),
-            "id": i + 1,
-            "isFixed": 0,
-            "isPass": True,
-            "lat": round_to(lat, 7),
-            "lng": round_to(lng, 7),
-            "pointName": "",
-            "position": 999,
-            "state": 0,
-        })
-    return out
+    """五点实体（跑完态 isPass=true）。
+
+    ★★ 只接受【服务端下发的打卡点】，绝不接受轨迹点 ★★
+      · 自由跑：无围栏、无打卡点 → 传 []，fivePointJson 序列化为 "[]"
+      · 计分跑：传学校下发的点位（通常 3~5 个，isFixed=1 为必经点）
+
+    历史 bug（已修）：本函数原先对【轨迹点】逐点生成 isPass=true 的"假打卡点"，
+    导致 2km 自由跑（144 个轨迹点）往 fixed_point_json 里塞 144 个点位，
+    5km 就是上千个 —— 与真实 App 的「自由跑无点位」完全不符。
+
+    字段实现委托给 swsubmit.five_point_payload，保证提交 body 与 OBS 对象
+    里的 fivePointJson 结构完全一致（单一实现，避免两份漂移）。
+    """
+    if not points:
+        return []
+    import swsubmit
+    return swsubmit.five_point_payload(points, start_ms)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -275,11 +273,18 @@ def obs_keys(start_ms: int, rrid: int, uuid: str) -> list:
 
 
 def build_obs_object(points: list, *, rrid: int, uuid: str, uid: int,
-                     start_ms: int, total_time: int, with_steps: bool = True) -> dict:
+                     start_ms: int, total_time: int, with_steps: bool = True,
+                     fixed_points: list = None) -> dict:
     """组装 10 键 OBS 对象（值均 gzip+base64）
 
     with_steps 参数保留以兼容旧调用，但自由跑与计分跑【都要】完整
     步频/步幅数据（详情页图表数据源），不再清零。
+
+    fixed_points：【服务端下发的打卡点】，只用于 fixed_point_json 里的
+      fivePointJson。
+        · 自由跑 → 传 [] 或 None → fivePointJson = "[]"（无点位）
+        · 计分跑 → 传学校下发的点位
+      ★ 绝不传轨迹点：轨迹点属于 run_data.allLocJson，两者是不同的东西。
     """
     pts = [conv_point(p, start_ms) for p in points]
     run_wrap = {"allLocJson": json.dumps(pts, separators=(",", ":"),
@@ -287,7 +292,7 @@ def build_obs_object(points: list, *, rrid: int, uuid: str, uid: int,
                 "useZip": False}
     sp, stf = build_windows(points, start_ms, total_time, rrid)
     laps = build_laps(points, start_ms)
-    five = five_point_payload(points, start_ms)
+    five = five_point_payload(list(fixed_points or []), start_ms)
     fx = {"fivePointJson": json.dumps(five, separators=(",", ":"),
                                       ensure_ascii=False),
           "freedomShowFence": False,
@@ -351,11 +356,15 @@ def put_object(signed_url: str, payload: bytes) -> int:
 
 def upload_track(call_fn, points: list, *, rrid: int, uuid: str, uid: int,
                  start_ms: int, total_time: int, with_steps: bool = True,
-                 verbose: bool = True):
-    """完整 OBS 上传：组装 → 换签名 → 双 key PUT。返回成功数。"""
+                 fixed_points: list = None, verbose: bool = True):
+    """完整 OBS 上传：组装 → 换签名 → 双 key PUT。返回成功数。
+
+    fixed_points：服务端下发的打卡点（自由跑传 [] / 不传 → fivePointJson="[]"）。
+    """
     obj = build_obs_object(points, rrid=rrid, uuid=uuid, uid=uid,
                            start_ms=start_ms, total_time=total_time,
-                           with_steps=with_steps)
+                           with_steps=with_steps,
+                           fixed_points=fixed_points)
     payload = json.dumps(obj, separators=(",", ":"),
                          ensure_ascii=False).encode("utf-8")
     keys = obs_keys(start_ms, rrid, uuid)
@@ -463,7 +472,34 @@ def selftest() -> bool:
     print("  %s coorType=gcj02" % ("OK " if locs[0]["coorType"] == "gcj02" else "FAIL"))
     ok &= locs[0]["coorType"] == "gcj02"
 
-    # 6) id 规则
+    # 6) ★★ 五点来源：轨迹点【不得】出现在 fixed_point_json 里
+    fx = json.loads(_gz.decompress(
+        base64.b64decode(obj["fixed_point_json"])).decode("utf-8"))
+    five_free = json.loads(fx["fivePointJson"])
+    print("  [自由跑] fixed_point_json 点位数=%d (期望 0)" % len(five_free))
+    print("  %s 自由跑 fivePointJson == \"[]\"（无点位）"
+          % ("OK " if len(five_free) == 0 else "FAIL"))
+    ok &= len(five_free) == 0
+
+    cps = [{"pointName": "一号点", "lat": 22.98, "lon": 116.33,
+            "glat": 22.981, "glon": 116.335, "radius": 15.0, "isFixed": 1},
+           {"pointName": "二号点", "lat": 22.99, "lon": 116.34,
+            "glat": 22.991, "glon": 116.345, "radius": 15.0, "isFixed": 0}]
+    obj2 = build_obs_object(pts, rrid=1322680573, uuid="UUID-T", uid=12345678,
+                            start_ms=1789534834000, total_time=10,
+                            fixed_points=cps)
+    fx2 = json.loads(_gz.decompress(
+        base64.b64decode(obj2["fixed_point_json"])).decode("utf-8"))
+    five2 = json.loads(fx2["fivePointJson"])
+    good2 = (len(five2) == 2 and five2[0]["pointName"] == "一号点"
+             and five2[0]["isFixed"] == 1 and "lon" in five2[0]
+             and "lng" not in five2[0])
+    print("  [计分跑] fixed_point_json 点位数=%d (期望 2)" % len(five2))
+    print("  %s 计分跑五点 = 真实打卡点（pointName/isFixed/lon 正确）"
+          % ("OK " if good2 else "FAIL"))
+    ok &= good2
+
+    # 7) id 规则
     print("  speed_json[0].id 规则: (rrid%%100000)*1000+hi")
     spj = json.loads(_gz.decompress(base64.b64decode(obj["speed_json"])).decode("utf-8"))
     exp_id = (1322680573 % 100000) * 1000 + 10
