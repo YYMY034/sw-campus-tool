@@ -65,17 +65,43 @@ Android 端、并用自抓包做了字段键序校准与加密实现验证。**�
 
 ---
 
-## 📦 下载免安装版（推荐给普通用户）
+## 📦 下载（推荐给普通用户）
 
-不想折腾环境？直接下载**绿色免安装包**（内置 Python 运行时，解压即用）：
+不想折腾环境？直接下载打包好的成品 —— **Windows 与 Android 都有**：
 
-**➡️ [下载 sw-campus-tool-win-x64.zip](https://github.com/YYMY034/sw-campus-tool/releases/latest)**
+| 平台 | 资产 | 说明 |
+| --- | --- | --- |
+| **Windows x64** | [`sw-campus-tool-win-x64.zip`](https://github.com/YYMY034/sw-campus-tool/releases/latest) | 绿色免安装，**内置 Python 运行时**，解压即用 |
+| **Android** | [`sw-campus-mobile.zip`](https://github.com/YYMY034/sw-campus-tool/releases/latest) | Termux 一键安装包，**无需 root**，手机也能跑 |
+
+### Windows
 
 1. 解压到任意目录（路径避免特殊字符）
 2. 双击 `Start.bat`
 3. 浏览器自动打开 `http://127.0.0.1:8765`，输入手机号 + 密码即可使用
 
-> 本仓库为**源码版**，适合想阅读/二次开发的用户，见下方说明。
+### Android（Termux）
+
+```bash
+# 1) 安装 Termux —— 请用 F-Droid 或 GitHub Releases 的 arm64-v8a 版
+#    ⚠️ 不要用 Google Play 版（已停止维护）
+# 2) 把 sw-campus-mobile.zip 传到手机「下载」目录，然后：
+termux-setup-storage
+pkg install -y unzip
+cd ~/storage/downloads && unzip -o sw-campus-mobile.zip && cd sw-campus-mobile
+bash install.sh     # 首次约 2~5 分钟，自动装好依赖
+bash start.sh       # 自动打开浏览器；没开就手动访问 http://127.0.0.1:8765
+```
+
+遇到问题先跑 `bash check.sh`，会把环境信息一次性打印出来。
+
+> **登录依赖**：登录需要 `numpy` + `Pillow` 来识别滑块验证码缺口。若点「登录」没反应，
+> 执行 `pkg install -y python-numpy python-pillow` 后重开控制台即可。
+> 也可以完全绕过登录 —— 把电脑上已登录的 `session.json`、`device_bind.json`、
+> `devices.json`、`active_device.txt` **这 4 个文件**一起拷进手机 `app/` 目录
+> （⚠️ 只拷 `session.json` 会因设备指纹不一致被风控拦截）。
+
+> 想阅读源码或二次开发？见 [GitHub 仓库](https://github.com/YYMY034/sw-campus-tool)。
 
 ---
 
