@@ -891,9 +891,12 @@ PAGE = r"""<!DOCTYPE html>
     .stat{grid-template-columns:repeat(2,1fr);gap:8px}
     .m-cards{grid-template-columns:repeat(2,1fr);gap:8px}
     .m-grid{grid-template-columns:1fr}
-    .lb-row input{flex:1 1 100%;margin-bottom:8px!important}
-    .lb-remember{flex:1 1 auto}
-    .lb-row button{flex:1 1 45%}
+    /* 登录区在手机端改为纵向堆叠：手机号一行、密码一行、登录按钮一行 */
+    .lb-row{flex-direction:column;align-items:stretch;gap:8px}
+    .lb-row input{flex:none;width:100%;margin:0!important}
+    .lb-row button{flex:none;width:100%;margin:0}
+    .lb-remember{flex:none;width:100%}
+    .lb-state{flex:none;width:100%;text-align:left}
     .modal-mask{padding:10px;align-items:flex-end}
     .modal{max-height:88vh;border-radius:8px 8px 0 0}
     .log{height:200px;font-size:11px}
