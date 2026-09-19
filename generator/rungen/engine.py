@@ -13,7 +13,9 @@ rungen/engine.py —— 跑步记录生成引擎
 from __future__ import annotations
 
 import math
+import os
 import random
+import time
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Sequence
 
@@ -87,8 +89,20 @@ class RunningGenerator:
         self.profile = profile or RunnerProfile()
         self.target_duration_s = target_duration_s
 
-        self.rng = random.Random(seed if seed is not None
-                                 else int(self.start_time.timestamp()))
+        # 随机源
+        # ★ 默认种子必须带熵（2026-09-19 修复）：
+        #   原先 `random.Random(int(start_time.timestamp()))` 让轨迹完全由
+        #   起跑时间决定 —— 起跑时间相同则轨迹**逐字节相同**。GUI 页面不刷新
+        #   时「开始时间」输入框的值不会变，于是连续几次跑步生成出一模一样的
+        #   轨迹（用户实测「每次轨迹都一样」）。
+        #   现在默认混入纳秒时钟 + 进程号，保证每次生成的路线形状不同；
+        #   显式传 seed 时仍完全可复现（调试用）。
+        if seed is not None:
+            self.rng = random.Random(seed)
+        else:
+            entropy = (int(self.start_time.timestamp()) * 1000003
+                       ^ time.time_ns() ^ (os.getpid() << 17))
+            self.rng = random.Random(entropy)
 
         # 结果缓存
         self.all_points_valid = False

@@ -1689,7 +1689,15 @@ async function doRun(){
     await getState();
   }catch(e){toast("提交异常:"+e);}
   finally{btn.dataset.busy="0";btn.disabled=false;btn.classList.remove("running");
-    bt.textContent="提交跑步记录";}
+    bt.textContent="提交跑步记录";
+    // ★ 跑完自动把「开始时间」刷新为当前时间：页面不刷新时该输入框的值不会变，
+    //   若沿用旧值会让下一次生成出**完全相同**的轨迹（起跑时间相同=种子相同）。
+    try{const d=new Date();const p2=n=>String(n).padStart(2,"0");
+      const localNow=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+"T"+p2(d.getHours())+":"+p2(d.getMinutes());
+      $("rStart").max=localNow;
+      setStartInput(localNow.replace("T"," ")+":00");
+    }catch(e){}
+  }
 }
 
 /* 日志 */
