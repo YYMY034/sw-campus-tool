@@ -906,6 +906,11 @@ PAGE = r"""<!DOCTYPE html>
     .devdd-opts{max-height:180px}
     .toast{left:12px;right:12px;top:12px;text-align:center}
     .mast .help-btn{font-size:11px;padding:4px 10px}
+    /* 窄屏下「输入框 + 按钮」的嵌套行改为纵向、各占一行：
+       避免「设备选择」与「＋新设备」横向挤压重叠（下拉列表还会盖住按钮） */
+    .row .row{flex-wrap:wrap;align-items:stretch}
+    .row .row>.devdd,.row .row>input,.row .row>select{flex:1 1 100%!important}
+    .row .row>button{flex:1 1 100%!important;margin:6px 0 0!important}
   }
   @media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important}}
 </style>
