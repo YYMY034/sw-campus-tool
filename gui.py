@@ -893,10 +893,15 @@ PAGE = r"""<!DOCTYPE html>
     .m-grid{grid-template-columns:1fr}
     /* 登录区在手机端改为纵向堆叠：手机号一行、密码一行、登录按钮一行 */
     .lb-row{flex-direction:column;align-items:stretch;gap:8px}
-    .lb-row input{flex:none;width:100%;margin:0!important}
-    .lb-row button{flex:none;width:100%;margin:0}
-    .lb-remember{flex:none;width:100%}
+    .lb-row>input{flex:none;width:100%;margin:0!important}   /* 只作用于账号/密码，避免误伤 checkbox */
+    .lb-row>button{flex:none;width:100%;margin:0}
+    .lb-remember{flex:none;width:100%;justify-content:flex-start}
+    .lb-remember input{flex:none!important;width:14px!important;height:14px!important;margin:0!important}
     .lb-state{flex:none;width:100%;text-align:left}
+    /* ★ 关键：.row>div 默认 flex:1（basis 0）会让 flex-wrap 永不换行，
+       导致「模式/距离/配速」「平台/设备/体重」三列被挤扁、文字折行。
+       窄屏下让每个字段各占一行。 */
+    .row>div{flex:1 1 100%!important}
     .modal-mask{padding:10px;align-items:flex-end}
     .modal{max-height:88vh;border-radius:8px 8px 0 0}
     .log{height:200px;font-size:11px}
@@ -906,11 +911,9 @@ PAGE = r"""<!DOCTYPE html>
     .devdd-opts{max-height:180px}
     .toast{left:12px;right:12px;top:12px;text-align:center}
     .mast .help-btn{font-size:11px;padding:4px 10px}
-    /* 窄屏下「输入框 + 按钮」的嵌套行改为纵向、各占一行：
-       避免「设备选择」与「＋新设备」横向挤压重叠（下拉列表还会盖住按钮） */
-    .row .row{flex-wrap:wrap;align-items:stretch}
-    .row .row>.devdd,.row .row>input,.row .row>select{flex:1 1 100%!important}
-    .row .row>button{flex:1 1 100%!important;margin:6px 0 0!important}
+    /* 设备选择 + 「＋新设备」：窄屏下各占一行，避免挤压重叠（下拉列表还会盖住按钮） */
+    #devDDBox{flex:1 1 100%!important}
+    #devDDBox~button{flex:1 1 100%!important;margin:6px 0 0!important}
   }
   @media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important}}
 </style>
