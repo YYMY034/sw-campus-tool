@@ -102,22 +102,34 @@ class RunningGenerator:
     @staticmethod
     def _parse_time(t) -> datetime:
         if isinstance(t, datetime):
-            return t.replace(microsecond=0)
-        if isinstance(t, (int, float)):
-            return datetime.fromtimestamp(t).replace(microsecond=0)
-        s = str(t).strip()
-        fmts = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S",
-                "%Y/%m/%d %H:%M", "%m-%d %H:%M", "%H:%M:%S", "%H:%M")
-        for f in fmts:
-            try:
-                dt = datetime.strptime(s, f)
-                if "%Y" not in f:                    # 补全年月日
-                    now = datetime.now()
-                    dt = dt.replace(year=now.year, month=now.month, day=now.day)
-                return dt.replace(microsecond=0)
-            except ValueError:
-                continue
-        raise ValueError(f"无法解析时间: {t!r}")
+            dt = t.replace(microsecond=0)
+        elif isinstance(t, (int, float)):
+            dt = datetime.fromtimestamp(t).replace(microsecond=0)
+        else:
+            s = str(t).strip()
+            fmts = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S",
+                    "%Y/%m/%d %H:%M", "%m-%d %H:%M", "%H:%M:%S", "%H:%M")
+            dt = None
+            for f in fmts:
+                try:
+                    dt = datetime.strptime(s, f)
+                    if "%Y" not in f:                # 补全年月日
+                        now = datetime.now()
+                        dt = dt.replace(year=now.year, month=now.month,
+                                        day=now.day)
+                    dt = dt.replace(microsecond=0)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                raise ValueError(f"无法解析时间: {t!r}")
+        # ★ 硬护栏：起跑时间绝不允许在未来 —— 无论来自 GUI/CLI/配置文件，
+        #   一律回退到当前时间（否则轨迹点 ts 与提交体 startTime 落未来，
+        #   服务端会判异常并触发风控）。
+        now = datetime.now().replace(microsecond=0)
+        if dt > now:
+            dt = now
+        return dt
 
     # ------------------------------------------------------------------
     # 1. 速度曲线

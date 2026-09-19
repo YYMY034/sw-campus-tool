@@ -240,10 +240,22 @@ def random_run_time(dist: float, pace: str, prefer_hour: float = None) -> dict:
             continue
 
         ts_str = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(chosen))
+        # ★ 硬护栏：返回的起跑时间绝不允许在未来（哪怕边界算错/时钟漂移）
+        if chosen > now - 30:
+            chosen = now - 60
+            ts_str = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(chosen))
         return {"ok": True, "time": ts_str,
                 "note": "已避开当日 %d 条记录" % len(day_hits)}
     # 兜底：今天合理过去时间
     fallback = run_all._fmt_start(0, None, dur)
+    # ★ 兜底值同样不许在未来
+    try:
+        fb_ts = time.mktime(time.strptime(fallback, "%Y-%m-%d %H:%M:%S"))
+        if fb_ts > now - 30:
+            fallback = time.strftime("%Y-%m-%d %H:%M:00",
+                                     time.localtime(now - 60))
+    except Exception:
+        fallback = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(now - 60))
     return {"ok": True, "time": fallback, "note": "未对账（未登录或规则宽松）"}
 
 
@@ -866,6 +878,32 @@ PAGE = r"""<!DOCTYPE html>
   .lb-remember input{flex:none!important;width:14px;height:14px;margin:0!important;
        accent-color:var(--ac);cursor:pointer}
   @media(max-width:720px){.row{flex-wrap:wrap}.lb-row{flex-wrap:wrap}.lb-state{flex:100%;text-align:left}}
+  /* ── 手机窄屏适配（Termux 手机浏览器访问 127.0.0.1:8765）──────────────── */
+  @media(max-width:560px){
+    body{padding:16px 12px 36px;font-size:13px}
+    .mast{gap:10px}
+    .mark{width:34px;height:34px}
+    .mark i{left:7px;right:7px}
+    .mark i:first-child{top:9px}.mark i:nth-child(2){top:15px;background:rgba(255,255,255,.55)}.mark i:last-child{top:21px}
+    h1{font-size:19px}
+    .sub{font-size:11px;margin-bottom:10px}
+    .card{padding:12px 12px;margin-bottom:10px}
+    .stat{grid-template-columns:repeat(2,1fr);gap:8px}
+    .m-cards{grid-template-columns:repeat(2,1fr);gap:8px}
+    .m-grid{grid-template-columns:1fr}
+    .lb-row input{flex:1 1 100%;margin-bottom:8px!important}
+    .lb-remember{flex:1 1 auto}
+    .lb-row button{flex:1 1 45%}
+    .modal-mask{padding:10px;align-items:flex-end}
+    .modal{max-height:88vh;border-radius:8px 8px 0 0}
+    .log{height:200px;font-size:11px}
+    .submit-hero button{height:54px;font-size:16px}
+    button.small{height:38px;padding:0 10px}
+    input,select{padding:9px 8px;font-size:14px}
+    .devdd-opts{max-height:180px}
+    .toast{left:12px;right:12px;top:12px;text-align:center}
+    .mast .help-btn{font-size:11px;padding:4px 10px}
+  }
   @media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -1450,7 +1488,12 @@ async function randomTime(){
   const dist=parseFloat($("rDist").value)||2.15;
   const pace=$("rPace").value||"5:40";
   const res=await api("/api/random-time",{dist,pace});
-  if(res.ok&&res.time){setStartInput(res.time);toast("随机时间已填入："+res.time);}
+  if(res.ok&&res.time){
+    // ★ 每次随机后刷新输入框 max 为当前时间，确保填入的也是过去/现在
+    const d=new Date();const p2=n=>String(n).padStart(2,"0");
+    $("rStart").max=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+"T"+p2(d.getHours())+":"+p2(d.getMinutes());
+    setStartInput(res.time);toast("随机时间已填入："+res.time);
+  }
   else{toast("随机失败");}
 }
 
@@ -1703,7 +1746,11 @@ document.addEventListener("input",e=>{
   syncModeDD();   // 模式下拉显示与默认值同步
   const d=new Date();
   const p2=n=>String(n).padStart(2,"0");
-  setStartInput(d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+" 18:30:00");
+  // ★ 开始时间默认=当前时间（不要写死 18:30 —— 那在早上会是未来时间）
+  // 并给 datetime-local 设 max=当前时间，禁止用户选未来时刻。
+  const localNow=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+"T"+p2(d.getHours())+":"+p2(d.getMinutes());
+  $("rStart").max=localNow;
+  setStartInput(localNow.replace("T"," ")+":00");
   setInterval(pollLog,1000);
   if(restoredPwd&&!state.logged){
     setTimeout(()=>toast("已自动填入记住的账号密码，点「登录」即可"),600);
