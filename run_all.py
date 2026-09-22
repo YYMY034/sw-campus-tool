@@ -69,6 +69,24 @@ CLI = os.path.join(HERE, "swcli.py")
 import campus as _campus
 DEFAULT_CAMPUS = (_campus.DEFAULT_CAMPUS["lat"], _campus.DEFAULT_CAMPUS["lon"])
 
+# ★ 配速解析必须与生成器共用同一个实现（rungen.core.parse_pace）。
+#   曾经这里自带一套弱解析：纯数字按「分钟」算、"5'37\"" 解析失败后静默回退 340 ——
+#   于是「估算用时」与「实际生成轨迹」会用两个不同的配速，用户填 337 会得到 11 小时。
+#   用 append 而非 insert(0)，避免 generator/ 下的模块名遮蔽工程根模块。
+_GEN_DIR = os.path.join(HERE, "generator")
+if os.path.isdir(_GEN_DIR) and _GEN_DIR not in sys.path:
+    sys.path.append(_GEN_DIR)
+try:
+    from rungen.core import parse_pace as _parse_pace
+except Exception:                      # 生成器缺失时的兜底：保持同一语义
+    def _parse_pace(text: str) -> float:
+        """配速字符串 -> 秒/公里. 支持 5'37" / 5:37 / 337(秒)"""
+        t = str(text).strip().replace('"', '').replace("'", ':')
+        if ':' in t:
+            mm, ss = t.split(':')[:2]
+            return float(mm) * 60 + float(ss)
+        return float(t)
+
 # ── 校规硬约束（来自 runwatch 的 campusConfigModel）─────────────────
 VALID_START_H = 6            # 有效时段 06:00 起
 VALID_END_H = 22             # ★ 22:00 后禁止跑步（stopTime 必须 <= 22:00:59）
@@ -243,15 +261,21 @@ def reconcile(runs_a: list, dur_s: int, existing: list, per_day: int,
 
 
 def _pace_to_sec(pace: str, dist_km: float) -> int:
-    """配速 "5:40" + 距离 → 预计用时（秒）"""
+    """配速 + 距离 → 预计用时（秒）
+
+    ★ 走与生成器相同的解析器（`rungen.core.parse_pace`），保证
+      「估算用时」与「生成轨迹」用的是同一个配速值。
+      支持 `5:37` / `5'37"` / `337`（秒/公里），与前端 normPace 语义一致。
+    """
     try:
-        if ":" in pace:
-            mm, ss = pace.split(":")[:2]
-            p = int(mm) * 60 + int(ss)
-        else:
-            p = int(float(pace) * 60)
-    except Exception:
-        p = 340
+        p = _parse_pace(pace)
+        if not p or p <= 0:
+            raise ValueError("配速必须为正数")
+    except Exception as e:
+        # ★ 不静默：明确告知用了兜底值，而不是悄悄算出一个离谱的用时
+        print("[警告] 配速 %r 无法解析（%s），已按默认 5:40/km 估算用时"
+              % (pace, e), file=sys.stderr)
+        p = 340.0
     return max(300, int(p * dist_km))
 
 
