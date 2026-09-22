@@ -750,6 +750,13 @@ PAGE = r"""<!DOCTYPE html>
   .devdd-list .devdd-search input{margin:0;border:none;border-bottom:1px solid var(--line);
        height:38px;padding:0 11px;background:transparent;font-size:13px}
   .devdd-list .devdd-search input:focus{border-color:var(--line)}
+  /* 自定义配速输入行（固定在列表顶部，不随搜索重建） */
+  .devdd-list .devdd-custom{display:flex;gap:6px;padding:8px 9px;
+       border-bottom:1px solid var(--line);background:#FCFAF4}
+  .devdd-list .devdd-custom input{flex:1;min-width:0;margin:0;height:34px;
+       font-size:13px;padding:0 10px}
+  .devdd-list .devdd-custom button{flex:none;width:auto;margin:0;height:34px;
+       padding:0 12px;font-size:13px;letter-spacing:0}
   .devdd-opts{max-height:210px;overflow-y:auto}
   .devdd-opts .dd-opt{padding:9px 11px;font-size:13px;cursor:pointer;
        border-bottom:1px solid #F0EAE0;white-space:nowrap;overflow:hidden;
@@ -965,6 +972,12 @@ PAGE = r"""<!DOCTYPE html>
           <div class="devdd-list" id="paceDDList">
             <div class="devdd-search">
               <input id="paceSearch" placeholder="搜索配速…" oninput="renderPaceList()">
+            </div>
+            <!-- ★ 自定义配速：自己填 分:秒（或秒数），回车 / 点「添加」即可 -->
+            <div class="devdd-custom">
+              <input id="paceCustomIn" placeholder="自定义配速，如 5:37" inputmode="decimal"
+                     onkeydown="if(event.key==='Enter'){event.preventDefault();applyCustomPace();}">
+              <button type="button" onclick="applyCustomPace()">添加</button>
             </div>
             <div class="devdd-opts" id="paceOpts"></div>
           </div>
@@ -1526,17 +1539,35 @@ const PACES=["4:00","4:15","4:30","4:45","5:00","5:15","5:30","5:45",
              "6:00","6:15","6:30","6:45","7:00","7:15","7:30","7:45",
              "8:00","8:15","8:30","8:45","9:00","9:15","9:30","9:45","10:00"];
 const PACE_LBL={"4:00":"4:00（快）","5:40":"5:40（常用）","10:00":"10:00（慢）"};
-function setPaceSelect(pace){
-  if(!pace)return;
-  const target=pace.trim();
-  const toSec=v=>{const m=v.split(":").map(Number);return m[0]*60+(m[1]||0);};
-  let best=target,bestGap=Infinity;
-  for(const v of PACES){
-    const gap=Math.abs(toSec(v)-toSec(target));
-    if(gap<bestGap){bestGap=gap;best=v;}
+let CUSTOM_PACES=[];   /* 用户自定义配速（本次会话保留，显示在列表里） */
+/* 归一化配速："5:37" / "5'37\"" / "337"(秒) -> "5:37"；非法返回 null */
+function normPace(s){
+  if(s==null)return null;
+  s=String(s).trim().replace(/["”″]/g,"").replace(/['’‘′]/g,":")
+   .replace(/：/g,":").replace(/\s+/g,"");
+  if(!s)return null;
+  if(s.indexOf(":")<0){                       /* 纯数字 = 秒/公里 */
+    const n=Number(s);
+    if(!isFinite(n)||n<120||n>1800)return null;
+    return Math.floor(n/60)+":"+String(Math.round(n%60)).padStart(2,"0");
   }
-  $("rPace").value=best;
-  $("paceDDTxt").textContent=PACE_LBL[best]||best;
+  const p=s.split(":");
+  if(p.length!==2)return null;
+  const m=Number(p[0]),ss=Number(p[1]);
+  if(!isFinite(m)||!isFinite(ss)||m<2||m>30||ss<0||ss>59)return null;
+  return m+":"+String(ss).padStart(2,"0");
+}
+function paceLabel(v){
+  if(PACE_LBL[v])return PACE_LBL[v];
+  return PACES.indexOf(v)>=0?v:v+"（自定义）";
+}
+/* ★ 设配速：保留原值（不再吸附到最近的预设 —— 那会把「一键设置」的历史平均配速取整） */
+function setPaceSelect(pace){
+  const v=normPace(pace);
+  if(!v)return;
+  if(PACES.indexOf(v)<0&&CUSTOM_PACES.indexOf(v)<0)CUSTOM_PACES.push(v);
+  $("rPace").value=v;
+  $("paceDDTxt").textContent=paceLabel(v);
   renderPaceList();
   updatePaceTotal();
 }
@@ -1544,26 +1575,40 @@ function renderPaceList(){
   const kw=($("paceSearch").value||"").trim().toLowerCase();
   const cur=$("rPace").value;
   const box=$("paceOpts");box.innerHTML="";
-  let shown=PACES.slice();
-  if(kw)shown=PACES.filter(v=>v.toLowerCase().indexOf(kw)>=0);
+  /* 预设 + 已添加的自定义 + 当前值（保证当前值总能出现在列表里） */
+  const all=PACES.concat(CUSTOM_PACES.filter(v=>PACES.indexOf(v)<0));
+  if(cur&&all.indexOf(cur)<0)all.push(cur);
+  let shown=all;
+  if(kw)shown=all.filter(v=>v.toLowerCase().indexOf(kw)>=0||(PACE_LBL[v]||"").indexOf(kw)>=0);
   if(!shown.length){
     const d=document.createElement("div");d.className="dd-none";
-    d.textContent="（无匹配配速）";box.appendChild(d);return;
+    d.textContent="（无匹配，可在上方自定义添加）";box.appendChild(d);return;
   }
   shown.forEach(v=>{
     const o=document.createElement("div");
     o.className="dd-opt"+(v===cur?" sel":"");
-    o.textContent=PACE_LBL[v]||v;
+    o.textContent=paceLabel(v);
     o.onclick=()=>setPaceValue(v);
     box.appendChild(o);
   });
 }
 function setPaceValue(v){
   $("rPace").value=v;
-  $("paceDDTxt").textContent=PACE_LBL[v]||v;
+  $("paceDDTxt").textContent=paceLabel(v);
   closePaceDD();
   renderPaceList();
   updatePaceTotal();
+}
+/* 自定义配速：读输入框 -> 校验 -> 设为当前配速 */
+function applyCustomPace(){
+  const el=$("paceCustomIn");if(!el)return;
+  const v=normPace(el.value);
+  if(!v){toast("配速格式不对：请填 分:秒（如 5:37），或直接填秒数（如 337）");return;}
+  if(PACES.indexOf(v)<0&&CUSTOM_PACES.indexOf(v)<0)CUSTOM_PACES.push(v);
+  el.value="";
+  closePaceDD();
+  setPaceValue(v);
+  toast("已设为自定义配速 "+v);
 }
 function togglePaceDD(e){
   e=e||window.event;
