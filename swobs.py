@@ -173,73 +173,119 @@ def conv_point(p: dict, start_ms: int) -> dict:
 # 10 秒窗 / 圈 / 五点
 # ══════════════════════════════════════════════════════════════════
 def build_windows(points: list, start_ms: int, total_time: int, rrid: int):
-    """10 秒窗 speed / step_freq。
+    """10 秒窗 speed / step_freq（委托 swsubmit.android_tensec，单一实现）。
 
     ★ id 规则（新版本）：id = (rrid % 100000) * 1000 + 窗口右边界秒数
       注意与旧版「全局序号 60000+n」不同 —— 旧版提交不报错但详情页轨迹异常。
+
+    ★★ 2026-09-24：原先这里自己实现了一遍「就近吸附」取窗，与提交体
+      （swsubmit.android_tensec）各写一份、口径还漂移过。现统一委托，
+      两处永远是同一份数据；queueNum 仍按各自历史行为（OBS 侧 0）。
     """
-    sp, stf = [], []
-    w = 10
-    while w <= total_time:
-        lo, hi = w - 10, min(w, total_time)
-        d_lo = s_lo = 0.0
-        d_hi = s_hi = 0.0
-        for p in points:
-            tt = float(p.get("t_rel", 0))
-            if tt <= lo:
-                d_lo, s_lo = float(p.get("dist", 0)), float(p.get("steps", 0))
-            if tt <= hi:
-                d_hi, s_hi = float(p.get("dist", 0)), float(p.get("steps", 0))
-        dist = round_to(max(d_hi - d_lo, 0.0), 4)
-        steps_n = int(max(s_hi - s_lo, 0))
-        wid = (rrid % 100000) * 1000 + hi
-        sp.append({"beginTime": start_ms + lo * 1000, "distance": dist,
-                   "endTime": start_ms + hi * 1000, "flag": start_ms,
-                   "id": wid, "queueNum": 0, "state": 0})
-        stf.append({"avgDiff": 0.0, "beginTime": start_ms + lo * 1000,
-                    "endTime": start_ms + hi * 1000, "flag": start_ms,
-                    "id": wid, "maxDiff": 0.0, "minDiff": 1000.0,
-                    "queueNum": 0, "state": 0, "stepsNum": steps_n})
-        w += 10
+    import swsubmit
+    sp = swsubmit.android_tensec(points, start_ms, total_time, "speed",
+                                 rrid=rrid, queue_num="zero")
+    stf = swsubmit.android_tensec(points, start_ms, total_time, "steps",
+                                  rrid=rrid, queue_num="zero")
     return sp, stf
 
 
 def build_laps(points: list, start_ms: int) -> list:
-    """每 1000m 一圈，末圈 isFullLap=false；avgStride 单位厘米"""
+    """每 1000m 一圈，末圈 isFullLap=false；avgStride 单位厘米。
+
+    ★★ 圈界按【精确 1000m 线性插值】(2026-09-24 修复)
+      旧实现取「首个跨过 1000m 的采样点」当圈界，圈长会多出最多一个采样
+      间隔：实测第 1 圈 1013.4m 而时间只到该采样点 —— 分段配速因此系统性
+      偏慢约 1.3%（显示 5'40" 而真值 5'37"），用户看到的「分段/实时配速对不上」。
+      真机是 1Hz 采样所以偏差可忽略；采样稀疏时必须插值。
+    """
     laps = []
-    prev_d = prev_t = prev_steps = 0
-    gain = 0.0
-    alt0 = float(points[0].get("ele", 0) or 0) if points else 0.0
-    for i, p in enumerate(points):
-        if i > 0:
-            dd = float(p.get("ele", 0) or 0) - float(points[i - 1].get("ele", 0) or 0)
-            if dd > 0:
-                gain += dd
-        d_now = float(p.get("dist", 0) or 0)
-        t_now = int(round(float(p.get("t_rel", 0) or 0)))
-        last = i == len(points) - 1
-        if d_now - prev_d >= 1000.0 or last:
-            lap_d = d_now - prev_d
-            lap_t = max(1, t_now - prev_t)
-            lap_steps = int(p.get("steps", 0) or 0) - prev_steps
-            laps.append({
-                "avgCadence": round_to(lap_steps / (lap_t / 60.0), 2),
-                "avgPace": round_to((lap_t / 60.0) / max(lap_d / 1000.0, 0.001), 2),
-                "avgStride": round_to(lap_d / max(1, lap_steps) * 100.0, 2),
-                "cumulativeDuration": t_now,
-                "distance": round_to(lap_d, 4),
-                "duration": lap_t,
-                "elevationGain": round_to(gain, 2),
-                "endAltAbs": round_to(float(p.get("ele", 0) or 0), 2),
-                "endAltRel": round_to(float(p.get("ele", 0) or 0) - alt0, 2),
-                "flag": start_ms,
-                "id": len(laps) + 1,
-                "isFullLap": lap_d >= 1000.0,
-                "lapIndex": len(laps) + 1,
-                "step": lap_steps,
-            })
-            prev_d, prev_t, prev_steps = d_now, t_now, int(p.get("steps", 0) or 0)
-            gain = 0.0
+    if len(points) < 2:
+        return laps
+    ds = [float(p.get("dist", 0) or 0) for p in points]
+    ts = [float(p.get("t_rel", 0) or 0) for p in points]
+    es = [float(p.get("ele", 0) or 0) for p in points]
+    ss = [float(p.get("steps", 0) or 0) for p in points]
+    alt0 = es[0]
+    total_d = ds[-1]
+    if total_d <= 0:
+        return laps
+
+    def _at(d):
+        """在累计距离 d 处线性插值出 (t, ele, steps)"""
+        if d <= ds[0]:
+            return ts[0], es[0], ss[0]
+        if d >= total_d:
+            return ts[-1], es[-1], ss[-1]
+        lo, hi = 0, len(ds) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if ds[mid] <= d:
+                lo = mid
+            else:
+                hi = mid
+        span = ds[hi] - ds[lo]
+        f = 0.0 if span <= 1e-9 else (d - ds[lo]) / span
+        return (ts[lo] + (ts[hi] - ts[lo]) * f,
+                es[lo] + (es[hi] - es[lo]) * f,
+                ss[lo] + (ss[hi] - ss[lo]) * f)
+
+    def _gain(d_a, d_b):
+        """[d_a, d_b] 区间的正爬升（按采样点 + 端点插值近似）"""
+        g = 0.0
+        prev = _at(d_a)[1]
+        for i, d in enumerate(ds):
+            if d <= d_a:
+                continue
+            if d >= d_b:
+                break
+            if es[i] > prev:
+                g += es[i] - prev
+            prev = es[i]
+        e_b = _at(d_b)[1]
+        if e_b > prev:
+            g += e_b - prev
+        return g
+
+    bounds = []
+    k = 0
+    while (k + 1) * 1000.0 <= total_d + 1e-6:
+        bounds.append([k * 1000.0, min((k + 1) * 1000.0, total_d)])
+        k += 1
+    tail = total_d - k * 1000.0
+    if tail >= 1.0:
+        bounds.append([k * 1000.0, total_d])
+    elif tail > 0 and bounds:
+        # ★ 残尾不足 1m 时【并入上一圈】而不是单列一圈：
+        #   闭环标定残差会让 total_d 落在 2000.000031 / 2000.72 这种值上，
+        #   单列会造出 3cm 的 0 长度空圈（段时 1s、配速 16'40"），
+        #   或者让"段距和"比总距少 0.72m（两者都一眼看出是造的）。
+        bounds[-1][1] = total_d
+    if not bounds:
+        bounds = [[0.0, total_d]]
+
+    for i, (d_a, d_b) in enumerate(bounds):
+        t_a, e_a, s_a = _at(d_a)
+        t_b, e_b, s_b = _at(d_b)
+        lap_d = d_b - d_a
+        lap_t = max(1.0, t_b - t_a)
+        lap_steps = int(max(0.0, s_b - s_a))
+        laps.append({
+            "avgCadence": round_to(lap_steps / (lap_t / 60.0), 2),
+            "avgPace": round_to((lap_t / 60.0) / max(lap_d / 1000.0, 0.001), 2),
+            "avgStride": round_to(lap_d / max(1, lap_steps) * 100.0, 2),
+            "cumulativeDuration": int(round(t_b)),
+            "distance": round_to(lap_d, 4),
+            "duration": int(round(lap_t)),
+            "elevationGain": round_to(_gain(d_a, d_b), 2),
+            "endAltAbs": round_to(e_b, 2),
+            "endAltRel": round_to(e_b - alt0, 2),
+            "flag": start_ms,
+            "id": i + 1,
+            "isFullLap": lap_d >= 1000.0 - 1e-9,
+            "lapIndex": i + 1,
+            "step": lap_steps,
+        })
     return laps
 
 

@@ -264,6 +264,9 @@ class RunningGenerator:
 
         # 用 round 而非 int：让总时长更贴近 est_dur（误差 < 半个采样间隔）
         n = max(20, int(round(est_dur / self.dt)) + 1)
+        # ★ 交给 _walk 复用同一个目标时长：_walk 会据此把采样步长归一化，
+        #   使**总时长精确等于 est_dur**（不再有 ±2~3 秒的随机游走尾巴）。
+        self._est_dur = est_dur
 
         # --- 速度曲线 ---
         speeds = self._speed_profile(n)
@@ -586,7 +589,13 @@ class RunningGenerator:
         total = cumlen[-1] or 1.0
 
         # 速度积分 -> 归一化进度 [0,1]
-        steps = [v * self.dt for v in speeds]
+        # ★ 必须用【真实采样步长】加权（2026-09-24）
+        #   旧实现一律乘标称 self.dt，而 _walk 的时间步长是不规则的
+        #   （20% 是 1~8 秒）。于是"标称 5 秒的位移"可能只花 1 秒走完，
+        #   瞬时速度被放大 5 倍，10 秒窗里就混进 4.3 m/s 的假快段。
+        #   让几何分配与时间步长共用同一份 steps，速度与位移才自洽。
+        _st = self._get_steps(n, self._target_dur())
+        steps = [v * s for v, s in zip(speeds, _st)]
         run = [0.0]
         for s in steps:
             run.append(run[-1] + s)
@@ -630,7 +639,73 @@ class RunningGenerator:
         return out
 
     # ------------------------------------------------------------------
-    def _walk(self, coords, speeds, n) -> Tuple[List[GeoPoint], float]:
+    def _target_dur(self) -> float:
+        """本次生成的目标总时长(秒) —— 几何分配与时间步长共用同一口径"""
+        d = getattr(self, "_est_dur", None)
+        if d is not None:
+            return float(d)
+        if self.target_duration_s:
+            return float(self.target_duration_s)
+        return self.distance_m / self.profile.base_speed
+
+    def _get_steps(self, n: int, total_s: float) -> List[float]:
+        """取采样步长（同一轮生成内缓存，保证几何分配与 _walk 完全一致）
+
+        ★ 必须缓存：`_walk` 在闭环标定里会被调用最多 6 次，若每次都重新
+          抽样，则几何分配（只算一次）与时间步长（每次都变）对不上，
+          逐点 speed = seg/step 会随机漂移。
+        """
+        cache = getattr(self, "_steps_cache", None)
+        if cache is not None and cache[0] == n and abs(cache[1] - total_s) < 1e-9:
+            return cache[2]
+        steps = self._sample_steps(n, total_s)
+        self._steps_cache = (n, total_s, steps)
+        return steps
+
+    def _sample_steps(self, n: int, total_s: float) -> List[float]:
+        """生成 n-1 个采样步长(秒), 总和精确等于 total_s。
+
+        ★ 为什么不能用「固定间隔 ±6% 抖动」(2026-09-24 重做)
+            旧实现是 `self.dt * (1 + uniform(-0.06, 0.06))`, 有两个副作用:
+              ① 抖动幅度只有 ±0.3s, `int(round(t_rel))` 之后**又落回 5 秒网格**
+                 —— 上传的 27 键点里 totalTime 是 0/5/10/15/20…, 一眼看出是造的;
+              ② 步长均值仍等于 dt, 但随机游走让**总时长偏离目标 ±2~3 秒**
+                 (填 5'37" 跑 2km 应 674s, 实测 676.6s) —— 用户说的「时长对不上」。
+            真机样本(见 NekoSportsWorldTool/src/track/generator.rs)的分布是:
+            80% 落在标称间隔, 20% 是 1~8 秒的零散值 —— 整数秒因此不规则。
+        """
+        m = max(0, n - 1)
+        if m == 0:
+            return []
+        rng = self.rng
+        dt = self.dt
+        # ★ 退化保护：目标时长撑不满"标称间隔的一半"时（n 被 max(20, …) 顶到 20，
+        #   而总时长只有几秒），下面那套绝对步长(5s / 1~8s) 会被末尾的整体缩放
+        #   压到 0.03s，`speed = seg/step` 直接飙到几百 m/s。直接均分最稳。
+        if total_s <= m * dt * 0.5:
+            return [total_s / m] * m
+        steps: List[float] = []
+        for _ in range(m):
+            if rng.random() < 0.80:
+                steps.append(dt)
+            else:
+                steps.append(float(rng.choice((1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0))))
+        # 总时长对齐: 差值平摊到「零散步」上, 标称步保持 dt 不变
+        # (保住"主体是 5 秒采样"的真实感, 同时让总时长精确命中目标)
+        loose = [i for i, s in enumerate(steps) if s != dt]
+        delta = total_s - sum(steps)
+        if loose and abs(delta) > 1e-9:
+            per = delta / len(loose)
+            for i in loose:
+                steps[i] = max(0.5, steps[i] + per)
+        # 夹取后仍有残差 → 整体缩放兜底(保证总和精确, 不留 ±秒 的尾巴)
+        resid = total_s - sum(steps)
+        if abs(resid) > 1e-6 and sum(steps) > 0:
+            k = total_s / sum(steps)
+            steps = [s * k for s in steps]
+        return steps
+
+    def _walk(self, coords, speeds, n, total_s=None) -> Tuple[List[GeoPoint], float]:
         """沿几何点列按速度推进, 生成 GeoPoint 列表"""
         points: List[GeoPoint] = []
         cum = 0.0
@@ -638,40 +713,53 @@ class RunningGenerator:
         prev_la, prev_lo = coords[0]
         t0 = self.start_time
 
-        # ★ 采样间隔抖动幅度 (±6%)：真实 GPS 定时器有漂移。
-        #   严格等间隔会让**总时长与每公里分段用时永远是采样间隔的整数倍**
-        #   (5s 网格 → 总时长 11:30、分段 350s/340s 这种"整"数)，一眼看出是造的。
-        #   抖动后总时长 ≈ 目标 ±0.3%(随机游走收敛)，分段用时也不再落在整网格上。
-        jitter = 0.06
+        if total_s is None:
+            total_s = self._target_dur()
+        steps = self._get_steps(n, total_s)
 
         for i in range(n):
             la, lo = coords[i]
+            pushed = False
 
             if i == 0:
                 seg = 0.0
                 step = 0.0          # 首点时间 = 起跑时间本身
             else:
-                step = self.dt * (1.0 + self.rng.uniform(-jitter, jitter))
+                step = steps[i - 1]
                 seg = haversine(prev_la, prev_lo, la, lo)
                 # ★ 间距过小 (折返/绕圈处几何打结) 时不要把速度虚增上去:
                 #   早期实现是沿朝向"拉开到 speed*dt", 这会造出一个
                 #   5.8 m/s 的假尖峰 (平均才 3.0), 进而把步幅推到 195cm。
                 #   正确做法: 只把该点**沿路径推进到最小间距** (min_gap),
                 #   速度仍由 speed profile 决定 —— 间距与速度解耦。
-                min_gap = max(0.4, speeds[i] * self.dt * 0.55)
+                # ★ 用【本点真实步长】而非标称 dt：步长不规则后（1~8s），
+                #   按 dt 算的 min_gap 会在 1 秒的小步上放行过短的几何间距。
+                min_gap = max(0.4, speeds[i] * step * 0.55)
                 if seg < min_gap:
                     brg = (bearing(prev_la, prev_lo, la, lo)
                            if seg > 1e-9 else self.rng.uniform(0, 360))
                     la, lo = dest_point(prev_la, prev_lo, brg, min_gap)
                     seg = haversine(prev_la, prev_lo, la, lo)
+                    pushed = True
 
             cum += seg
             elapsed += step
             ts = int((t0 + timedelta(seconds=elapsed)).timestamp() * 1000)
 
+            # ★ 速度口径：被 min_gap 抬升过的点不能再用 seg/step ——
+            #   那时 seg 恰好等于 min_gap = speeds[i]*step*0.55，于是
+            #   seg/step 恒等于 **0.55 × 目标速度**，在配速曲线上挖出一个
+            #   假低谷。按上面的设计意图（间距与速度解耦）直接取速度曲线值。
+            if i == 0 or step <= 0:
+                spd = speeds[0]
+            elif pushed:
+                spd = speeds[i]
+            else:
+                spd = seg / step
+
             points.append(GeoPoint(
                 lat=la, lon=lo, ts_ms=ts, ele=0.0,
-                speed=(seg / step if i > 0 and step > 0 else speeds[0]),
+                speed=spd,
                 dist_from_start=cum, seg_m=seg,
             ))
             prev_la, prev_lo = la, lo
@@ -833,39 +921,41 @@ class RunningGenerator:
                 d_b = total_d                       # 吸收尾巴
             if d_b > total_d:
                 d_b = total_d
-            a = self._index_at_distance(points, d_a)
-            b = self._index_at_distance(points, d_b)
-            if b > a:
-                s = self._make_split(km, points, a, b)
-                # 补上插值带来的端点精确化 (可选, 保持数据自洽)
-                s.distance_m = max(s.distance_m, 1e-6)
+            if d_b - d_a < 1e-6:
+                continue
+            s = self._make_split_span(km, points, d_a, d_b)
+            if s is not None:
                 splits.append(s)
 
         # 真正的尾巴段 (>= 30m)
         if not merge_tail and tail_d >= 30.0:
-            a = self._index_at_distance(points, n_full * 1000.0)
-            b = len(points) - 1
-            if b > a:
-                s = self._make_split(n_full + 1, points, a, b)
-                s.partial = True
-                splits.append(s)
+            if len(points) - 1 > self._index_at_distance(points, n_full * 1000.0):
+                s = self._make_split_span(n_full + 1, points,
+                                          n_full * 1000.0, total_d)
+                if s is not None:
+                    s.partial = True
+                    splits.append(s)
 
         return splits
 
-    @staticmethod
-    def _index_at_distance(points: List[GeoPoint], d: float) -> int:
-        """返回累计距离首次 >= d 的点下标 (线性扫描, 点数少时够快)"""
-        for i, p in enumerate(points):
-            if p.dist_from_start >= d:
-                return i
-        return len(points) - 1
+    def _make_split_span(self, km: int, points: List[GeoPoint],
+                         d_a: float, d_b: float) -> Optional[Split]:
+        """按【精确距离区间】[d_a, d_b] 造一段统计（端点线性插值）
 
-    def _make_split(self, km: int, points: List[GeoPoint],
-                    a: int, b: int) -> Split:
-        seg = points[a:b + 1]
-        d = seg[-1].dist_from_start - seg[0].dist_from_start
-        t = (seg[-1].ts_ms - seg[0].ts_ms) / 1000.0
+        ★ 与 _make_split(a, b) 的区别：那边用采样点下标当边界，段长会多出
+          最多一个采样间隔；这里用插值把段长精确钉在 d_b - d_a 上。
+        """
+        if d_b - d_a < 1e-6:
+            return None
+        t_a, _ = self._interp_at(points, d_a)
+        t_b, _ = self._interp_at(points, d_b)
+        d = d_b - d_a
+        t = max(0.0, t_b - t_a)
         pace = t / (d / 1000.0) if d > 0 else 0.0
+        # 内部采样点用于步频/步幅均值与爬升
+        i_a = self._index_at_distance(points, d_a)
+        i_b = self._index_at_distance(points, d_b)
+        seg = points[max(0, i_a - 1):i_b + 1] or points[i_a:i_a + 1]
         asc = 0.0
         for i in range(1, len(seg)):
             dd = seg[i].ele - seg[i - 1].ele
@@ -881,6 +971,44 @@ class RunningGenerator:
             elev_gain_m=asc,
             avg_hr=int(sum(p.hr for p in seg) / len(seg)),
         )
+
+    @staticmethod
+    def _index_at_distance(points: List[GeoPoint], d: float) -> int:
+        """返回累计距离首次 >= d 的点下标 (线性扫描, 点数少时够快)"""
+        for i, p in enumerate(points):
+            if p.dist_from_start >= d:
+                return i
+        return len(points) - 1
+
+    @staticmethod
+    def _interp_at(points: List[GeoPoint], d: float) -> Tuple[float, float]:
+        """在累计距离 d 处线性插值, 返回 (相对秒, 海拔)
+
+        ★ 分段边界必须插值而不是"取首个跨过的采样点" (2026-09-24)
+          采样间隔 ~5s 时, 用采样点当边界会让段长多出最多一个间隔
+          (实测第 1 公里 1013.4m), 分段配速因此系统性偏慢 ~1.3%
+          (显示 5'40" 而真值 5'37")。真机 1Hz 采样时偏差可忽略,
+          采样稀疏就必须插值 —— 本方法即该 docstring 早就承诺的口径。
+        """
+        if not points:
+            return 0.0, 0.0
+        t0 = points[0].ts_ms / 1000.0
+        if d <= points[0].dist_from_start:
+            return 0.0, points[0].ele
+        if d >= points[-1].dist_from_start:
+            return points[-1].ts_ms / 1000.0 - t0, points[-1].ele
+        lo, hi = 0, len(points) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if points[mid].dist_from_start <= d:
+                lo = mid
+            else:
+                hi = mid
+        span = points[hi].dist_from_start - points[lo].dist_from_start
+        f = 0.0 if span <= 1e-9 else (d - points[lo].dist_from_start) / span
+        ta = points[lo].ts_ms / 1000.0 - t0
+        tb = points[hi].ts_ms / 1000.0 - t0
+        return ta + (tb - ta) * f, points[lo].ele + (points[hi].ele - points[lo].ele) * f
 
     # ------------------------------------------------------------------
     def _resolve_checkpoints(self, points: List[GeoPoint]) -> List[dict]:

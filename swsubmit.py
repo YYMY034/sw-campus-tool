@@ -171,35 +171,86 @@ def official_kcal(weight: float, total_time: int, total_dis: float) -> int:
     return int(round_to(weight * km * 1.036, 0))
 
 
+def _track_stream(points: list) -> list:
+    """把轨迹点列压成 [(dt, dd, ds), ...] 的分段流（秒 / 米 / 步）"""
+    segs = []
+    for i in range(1, len(points)):
+        a, b = points[i - 1], points[i]
+        t0 = float(a.get("t_rel", a.get("ts", 0)) or 0)
+        t1 = float(b.get("t_rel", b.get("ts", 0)) or 0)
+        if t1 <= t0:
+            continue
+        segs.append([t1 - t0,
+                     float(b.get("dist", 0) or 0) - float(a.get("dist", 0) or 0),
+                     float(b.get("steps", 0) or 0) - float(a.get("steps", 0) or 0)])
+    return segs
+
+
+def _stream_reader(segs: list):
+    """按时间从分段流里取量（跨段自动结转）"""
+    cur = {"i": 0, "rem": list(segs[0]) if segs else [0.0, 0.0, 0.0]}
+
+    def take(sec: float):
+        d = s = 0.0
+        left = sec
+        while left > 1e-9:
+            if cur["i"] >= len(segs):
+                break
+            rt, rd, rs = cur["rem"]
+            if rt <= 1e-9:
+                cur["i"] += 1
+                if cur["i"] < len(segs):
+                    cur["rem"] = list(segs[cur["i"]])
+                continue
+            k = left if left < rt else rt
+            f = k / rt
+            d += rd * f
+            s += rs * f
+            cur["rem"] = [rt - k, rd - rd * f, rs - rs * f]
+            left -= k
+            if cur["rem"][0] <= 1e-9:
+                cur["i"] += 1
+                if cur["i"] < len(segs):
+                    cur["rem"] = list(segs[cur["i"]])
+        return d, s
+
+    return take
+
+
 def android_tensec(points: list, start_ms: int, total_time: int, kind: str,
-                   rrid: int = 0) -> list:
+                   rrid: int = 0, queue_num: str = "seq") -> list:
     """10 秒窗 speedPerTenSec / stepsPerTenSec。
 
     ★ id 规则（新版 App）：
         id = (rrid % 100000) * 1000 + 窗口右边界秒数
       旧版用全局序号 60000+n，服务端不报错但详情页轨迹会异常。
+
+    ★★ 窗口量必须按「整 10 秒配额结转」累加（2026-09-24 修复）
+      历史 bug：旧实现用**就近吸附** —— 取 `t_rel <= lo` 的最后一个采样点
+      当窗起点、`t_rel <= hi` 的最后一个点当窗终点。采样间隔 ~5s 时两端各
+      带最多一个采样间隔的偏差，于是"10 秒窗"实际只覆盖 3~15 秒的位移：
+      实测窗内配速在 3'34"~15'12" 之间乱跳，**均值比目标慢 22 s/km** ——
+      这正是用户看到的「实时配速表对不上」。
+      真机是 1Hz 采样，吸附误差 ≤1s，所以看不出问题；正确口径是
+      **窗口内的真实位移**：把轨迹按时间切成 10 秒配额，跨窗的部分结转到下一窗。
+      （与 NekoSportsWorldTool/src/track/generator.rs 的 ten_d/ten_t 结转一致。）
+
+    queue_num：提交体用窗口序号（历史行为），OBS 侧用 0（真机样本口径）。
     """
+    segs = _track_stream(points)
+    take = _stream_reader(segs)
     out = []
     seed = ((rrid % 100000) * 1000) if rrid else 60000
-    w = 10
-    while w <= total_time:
-        lo, hi = w - 10, min(w, total_time)
-        d_lo = s_lo = 0.0
-        d_hi = s_hi = 0.0
-        for p in points:
-            tt = p.get("t_rel", p.get("ts", 0))
-            if tt <= lo:
-                d_lo = p.get("dist", 0.0)
-                s_lo = p.get("steps", 0.0)
-            if tt <= hi:
-                d_hi = p.get("dist", 0.0)
-                s_hi = p.get("steps", 0.0)
-        dist = round_to(max(d_hi - d_lo, 0.0), 4)
-        steps_n = int(max(s_hi - s_lo, 0))
-        # 距离用实际轨迹长度更稳（窗口插值在点数稀疏时会截断）
+    n_win = int(total_time // 10)
+    for k in range(n_win):
+        lo = k * 10
+        hi = min(lo + 10, total_time)
+        dist, steps_n = take(float(hi - lo))
+        dist = round_to(max(dist, 0.0), 4)
+        steps_n = int(max(steps_n, 0.0))
         begin = start_ms + lo * 1000
         end = start_ms + hi * 1000
-        qn = w // 10 - 1
+        qn = k if queue_num == "seq" else 0
         win_id = seed + hi
         if kind == "speed":
             out.append({"beginTime": begin, "distance": dist, "endTime": end,
@@ -210,25 +261,22 @@ def android_tensec(points: list, start_ms: int, total_time: int, kind: str,
                         "flag": start_ms, "id": win_id, "maxDiff": 0.0,
                         "minDiff": 1000.0, "queueNum": qn, "state": 0,
                         "stepsNum": steps_n})
-        w += 10
     return out
 
 
 def window_distance_sum(points: list, total_time: int) -> float:
-    """10 秒窗距离累计（与 android_tensec 同口径，用于自洽校验）"""
+    """10 秒窗距离累计（与 android_tensec 同口径，用于自洽校验）
+
+    ★ 必须与 android_tensec 用同一套「整 10 秒配额结转」口径，否则校验值
+      会与真实提交的窗口距离对不上（旧版这里也是就近吸附）。
+    """
+    take = _stream_reader(_track_stream(points))
     tot = 0.0
-    w = 10
-    while w <= total_time:
-        lo, hi = w - 10, min(w, total_time)
-        d_lo = d_hi = 0.0
-        for p in points:
-            tt = p.get("t_rel", p.get("ts", 0))
-            if tt <= lo:
-                d_lo = p.get("dist", 0.0)
-            if tt <= hi:
-                d_hi = p.get("dist", 0.0)
-        tot += max(d_hi - d_lo, 0.0)
-        w += 10
+    for k in range(int(total_time // 10)):
+        lo = k * 10
+        hi = min(lo + 10, total_time)
+        d, _ = take(float(hi - lo))
+        tot += max(d, 0.0)
     return tot
 
 
