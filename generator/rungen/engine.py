@@ -834,9 +834,15 @@ class RunningGenerator:
         total_steps = int(sum(p.cadence / 60.0 * self.dt for p in points))
 
         # 爬升 / 下降 (阈值 0.15m 过滤噪声)
+        # ★ 必须用【序列化后的精度】计算：core.py 里 JSON 的 ele 是 round(,2)，
+        #   若这里用全精度、而上传侧（swsubmit.total_ascent）拿到的是 2 位小数，
+        #   阈值 0.15 附近的步长判定会分歧（实测最大差 0.30m），
+        #   再叠加上传字段取整为整数，就会出现「界面 108 而 App 109」这种 1m 差。
+        #   统一到 round(,2) 后，两处**同一份数据、同一套算法**。
         asc = desc = 0.0
-        for i in range(1, len(points)):
-            d = points[i].ele - points[i - 1].ele
+        _eles = [round(p.ele, 2) for p in points]
+        for i in range(1, len(_eles)):
+            d = _eles[i] - _eles[i - 1]
             if d > 0.15:
                 asc += d
             elif d < -0.15:
@@ -957,8 +963,9 @@ class RunningGenerator:
         i_b = self._index_at_distance(points, d_b)
         seg = points[max(0, i_a - 1):i_b + 1] or points[i_a:i_a + 1]
         asc = 0.0
-        for i in range(1, len(seg)):
-            dd = seg[i].ele - seg[i - 1].ele
+        _sele = [round(p.ele, 2) for p in seg]   # ★ 与 core.py 序列化精度一致（见 _build_record）
+        for i in range(1, len(_sele)):
+            dd = _sele[i] - _sele[i - 1]
             if dd > 0.15:
                 asc += dd
         return Split(

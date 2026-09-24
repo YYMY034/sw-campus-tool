@@ -236,21 +236,23 @@ def build_laps(points: list, start_ms: int) -> list:
                 ss[lo] + (ss[hi] - ss[lo]) * f)
 
     def _gain(d_a, d_b):
-        """[d_a, d_b] 区间的正爬升（按采样点 + 端点插值近似）"""
-        g = 0.0
-        prev = _at(d_a)[1]
+        """[d_a, d_b] 区间的正爬升（端点插值 + 单步 0.15m 阈值）。
+
+        ★ 阈值口径委托 `swsubmit.ele_gain`（唯一实现），与生成器界面显示的
+          `total_ascent_m`、提交体上传的 `totalAscent` 完全一致。
+          历史 bug：这里原先累加**所有**正差、不设阈值，而生成器带 0.15m 阈值，
+          于是「各圈爬升之和」比界面上显示的总爬升多 1~3m。
+        """
+        import swsubmit
+        eles = [_at(d_a)[1]]
         for i, d in enumerate(ds):
             if d <= d_a:
                 continue
             if d >= d_b:
                 break
-            if es[i] > prev:
-                g += es[i] - prev
-            prev = es[i]
-        e_b = _at(d_b)[1]
-        if e_b > prev:
-            g += e_b - prev
-        return g
+            eles.append(es[i])
+        eles.append(_at(d_b)[1])
+        return swsubmit.ele_gain(eles)
 
     bounds = []
     k = 0
@@ -307,6 +309,21 @@ def build_laps(points: list, start_ms: int) -> list:
             "lapIndex": i + 1,
             "step": lap_steps,
         })
+
+    # ★ 吸收「圈界插值残差」：让 Σlaps.elevationGain 精确等于按【整条轨迹】算的总爬升
+    #   （即提交体 totalAscent 的口径）。圈界插值会让边界处的上升被相邻两圈各分走
+    #   一部分、或两边都不算，实测残差 ≤0.25m —— 量不大，但足以在原始值落在 x.5
+    #   附近时让「取整后的整数」差 1m（实测 120 条里 4.2% 出现，如 Σ圈=137.28 而
+    #   上传=138）。与「残尾并入上一圈」「圈时长累计取整」同一思路：分项之和 == 总计。
+    #   残差并入【距离最大】的那一圈（它的爬升最大，±0.25m 不可能把它压成负数）。
+    if laps:
+        import swsubmit
+        _target = swsubmit.ele_gain(es)
+        _cur = sum(float(l["elevationGain"]) for l in laps)
+        if abs(_target - _cur) > 1e-9:
+            _k = max(range(len(laps)), key=lambda j: float(laps[j]["distance"]))
+            laps[_k]["elevationGain"] = round_to(
+                float(laps[_k]["elevationGain"]) + (_target - _cur), 2)
     return laps
 
 

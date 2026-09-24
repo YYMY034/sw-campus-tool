@@ -323,13 +323,42 @@ def prep_points(track: dict) -> tuple:
     return norm, total_dis, total_time, int(round(total_steps)), start_ms
 
 
+# ★ 高程噪声阈值（米）：单步上升不超过此值视为 GPS/气压高程抖动，不计入爬升。
+#   必须与生成器 `generator/rungen/engine.py` 同口径（`_build_record` 与
+#   `_make_split_span` 都用 0.15），否则「界面显示的总爬升」与「实际上传的
+#   totalAscent」会对不上 —— 实测前者 41.3 / 后者 42.0，差 1~2%。
+ELE_NOISE_M = 0.15
+
+
+def ele_gain(eles) -> float:
+    """按【单步阈值】累计爬升 —— 全项目唯一实现。
+
+    只有单步上升 > ELE_NOISE_M 才计入，且计入的是**整段上升**（不减掉阈值），
+    与 engine.py 的 `if d > 0.15: asc += d` 逐字一致。
+
+    ★ 提交体 `totalAscent` 与 OBS `laps[].elevationGain` 都走这里。
+      本项目已因「同一语义多份实现、口径悄悄漂移」踩过两次（配速解析、圈时长），
+      所以这里刻意只留一份。
+
+    ★ 结果归整到 2 位小数：调用方传入的 `ele` 都是 2 位小数（core.py 序列化时
+      `round(p.ele, 2)`），数学真值必然是 2 位小数；但浮点累加会带来 ~1e-14 噪声，
+      足以让恰好等于 x.50 的值偏到下方，使 half-up 取整**少 1**
+      （实测 raw=15.499999999999993 → 取整 15，而真值 15.5 应取整 16）。
+      归整后即为精确值，消除这一处刀锋级不确定。
+    """
+    g = 0.0
+    prev = None
+    for e in eles:
+        e = float(e or 0.0)
+        if prev is not None and e - prev > ELE_NOISE_M:
+            g += e - prev
+        prev = e
+    return round_to(g, 2)
+
+
 def total_ascent(points: list) -> float:
-    asc = 0.0
-    for i in range(1, len(points)):
-        d = points[i].get("ele", 0) - points[i - 1].get("ele", 0)
-        if d > 0:
-            asc += d
-    return asc
+    """轨迹总爬升（口径见 `ele_gain`）"""
+    return ele_gain([p.get("ele", 0) for p in points])
 
 
 # ══════════════════════════════════════════════════════════════════
