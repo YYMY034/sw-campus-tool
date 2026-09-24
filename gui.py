@@ -239,11 +239,13 @@ def random_run_time(dist: float, pace: str, prefer_hour: float = None) -> dict:
         if chosen is None:
             continue
 
-        ts_str = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(chosen))
+        # ★ 秒位保留（原为 ":00" 硬写）：chosen 本来就是带随机秒的浮点时间戳，
+        #   格式化成 ":00" 会把秒抹掉，于是起跑时间永远是 08:00:00 这种整分整秒。
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(chosen))
         # ★ 硬护栏：返回的起跑时间绝不允许在未来（哪怕边界算错/时钟漂移）
         if chosen > now - 30:
             chosen = now - 60
-            ts_str = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(chosen))
+            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(chosen))
         return {"ok": True, "time": ts_str,
                 "note": "已避开当日 %d 条记录" % len(day_hits)}
     # 兜底：今天合理过去时间
@@ -252,10 +254,10 @@ def random_run_time(dist: float, pace: str, prefer_hour: float = None) -> dict:
     try:
         fb_ts = time.mktime(time.strptime(fallback, "%Y-%m-%d %H:%M:%S"))
         if fb_ts > now - 30:
-            fallback = time.strftime("%Y-%m-%d %H:%M:00",
+            fallback = time.strftime("%Y-%m-%d %H:%M:%S",
                                      time.localtime(now - 60))
     except Exception:
-        fallback = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(now - 60))
+        fallback = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 60))
     return {"ok": True, "time": fallback, "note": "未对账（未登录或规则宽松）"}
 
 
@@ -1018,7 +1020,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="row">
       <div><label>开始时间</label>
         <div class="row" style="gap:6px">
-          <input id="rStart" type="datetime-local" step="60" style="flex:1">
+          <input id="rStart" type="datetime-local" step="1" style="flex:1">
           <button class="gray small" style="margin:0" onclick="randomTime()">随机</button>
         </div>
         <div class="hint" id="rStartHint" style="margin-top:4px;color:var(--sub)"></div></div>
@@ -1521,14 +1523,24 @@ async function randomTime(){
   else{toast("随机失败");}
 }
 
-/* datetime-local 与后端 "YYYY-MM-DD HH:MM:SS" 互转 */
+/* datetime-local 与后端 "YYYY-MM-DD HH:MM:SS" 互转
+   ★ 支持到秒：输入框 step=1 后值是 19 字符（含秒），也要兼容旧的 16 字符（到分）。 */
 function toLocalInput(s){
   if(!s)return "";
-  return s.replace(" ","T").slice(0,16);
+  const t=s.replace(" ","T");
+  return t.length>=19? t.slice(0,19) : t.slice(0,16);
 }
 function fromLocalInput(v){
   if(!v)return "";
-  return v.replace("T"," ")+":00";
+  const t=v.replace("T"," ");
+  return t.length>=19? t.slice(0,19) : t+":00";
+}
+/* 生成一个【过去】的起跑时间串（带随机秒）——整分整秒的 08:00:00 一眼看出是造的 */
+function pastStartStr(secAgo){
+  const d=new Date(Date.now()-(secAgo||90)*1000);
+  const p2=n=>String(n).padStart(2,"0");
+  return d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+" "
+    +p2(d.getHours())+":"+p2(d.getMinutes())+":"+p2(d.getSeconds());
 }
 function setStartInput(s){$("rStart").value=toLocalInput(s);}
 function getStartInput(){return fromLocalInput($("rStart").value);}
@@ -1751,7 +1763,7 @@ async function doRun(){
     try{const d=new Date();const p2=n=>String(n).padStart(2,"0");
       const localNow=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+"T"+p2(d.getHours())+":"+p2(d.getMinutes());
       $("rStart").max=localNow;
-      setStartInput(localNow.replace("T"," ")+":00");
+      setStartInput(pastStartStr(90));   // ★ 带随机秒，避免整分整秒
     }catch(e){}
   }
 }
@@ -1814,7 +1826,7 @@ document.addEventListener("input",e=>{
   // 并给 datetime-local 设 max=当前时间，禁止用户选未来时刻。
   const localNow=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+"T"+p2(d.getHours())+":"+p2(d.getMinutes());
   $("rStart").max=localNow;
-  setStartInput(localNow.replace("T"," ")+":00");
+  setStartInput(pastStartStr(90));   // ★ 带随机秒，避免 08:00:00 这种整分整秒
   setInterval(pollLog,1000);
   if(restoredPwd&&!state.logged){
     setTimeout(()=>toast("已自动填入记住的账号密码，点「登录」即可"),600);

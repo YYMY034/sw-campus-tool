@@ -256,10 +256,14 @@ class RunningGenerator:
             est_dur = float(self.target_duration_s)
             self.distance_m = prof.base_speed * est_dur
         else:
-            # 留出起步/疲劳余量
-            est_dur = self.distance_m / (prof.base_speed * 0.97)
+            # ★ 时长按【输入配速】精确反算 (2026-09-24 修复)
+            #   原先这里乘了 0.97 的"起步/疲劳余量"，副作用是**实际均速比输入配速
+            #   慢约 2~3%**：用户填 5:37，记录里却是 5:45，界面「总用时 ≈」也对不上。
+            #   速度曲线的起步/疲劳形态由 _speed_profile 负责，总时长不该再额外加码。
+            est_dur = self.distance_m / prof.base_speed
 
-        n = max(20, int(est_dur / self.dt) + 1)
+        # 用 round 而非 int：让总时长更贴近 est_dur（误差 < 半个采样间隔）
+        n = max(20, int(round(est_dur / self.dt)) + 1)
 
         # --- 速度曲线 ---
         speeds = self._speed_profile(n)
@@ -630,15 +634,24 @@ class RunningGenerator:
         """沿几何点列按速度推进, 生成 GeoPoint 列表"""
         points: List[GeoPoint] = []
         cum = 0.0
+        elapsed = 0.0
         prev_la, prev_lo = coords[0]
         t0 = self.start_time
+
+        # ★ 采样间隔抖动幅度 (±6%)：真实 GPS 定时器有漂移。
+        #   严格等间隔会让**总时长与每公里分段用时永远是采样间隔的整数倍**
+        #   (5s 网格 → 总时长 11:30、分段 350s/340s 这种"整"数)，一眼看出是造的。
+        #   抖动后总时长 ≈ 目标 ±0.3%(随机游走收敛)，分段用时也不再落在整网格上。
+        jitter = 0.06
 
         for i in range(n):
             la, lo = coords[i]
 
             if i == 0:
                 seg = 0.0
+                step = 0.0          # 首点时间 = 起跑时间本身
             else:
+                step = self.dt * (1.0 + self.rng.uniform(-jitter, jitter))
                 seg = haversine(prev_la, prev_lo, la, lo)
                 # ★ 间距过小 (折返/绕圈处几何打结) 时不要把速度虚增上去:
                 #   早期实现是沿朝向"拉开到 speed*dt", 这会造出一个
@@ -653,11 +666,12 @@ class RunningGenerator:
                     seg = haversine(prev_la, prev_lo, la, lo)
 
             cum += seg
-            ts = int((t0 + timedelta(seconds=i * self.dt)).timestamp() * 1000)
+            elapsed += step
+            ts = int((t0 + timedelta(seconds=elapsed)).timestamp() * 1000)
 
             points.append(GeoPoint(
                 lat=la, lon=lo, ts_ms=ts, ele=0.0,
-                speed=(seg / self.dt if i > 0 else speeds[0]),
+                speed=(seg / step if i > 0 and step > 0 else speeds[0]),
                 dist_from_start=cum, seg_m=seg,
             ))
             prev_la, prev_lo = la, lo

@@ -298,7 +298,7 @@ def _fmt_start(offset_days: int = 0, at: str = None,
     """构造一个合理的【过去】起跑时间。
 
     offset_days : 0=今天，1=昨天，…
-    at          : 显式指定时刻 "HH:MM"（用户选时）
+    at          : 显式指定时刻 "HH:MM" 或 "HH:MM:SS"（只给分钟时秒位随机）
     duration_s  : 预计跑量（秒），用于保证 start+duration <= 22:00
 
     约束：
@@ -321,8 +321,12 @@ def _fmt_start(offset_days: int = 0, at: str = None,
         latest = earliest + 60
 
     if at:
-        hh, mm = (int(x) for x in at.split(":")[:2])
-        ts = time.mktime((y, m, d, hh, mm, 0, 0, 0, -1))
+        parts = at.split(":")
+        hh, mm = int(parts[0]), int(parts[1])
+        # ★ 只给到分钟时，秒位随机（用户说的「07:30」指的是分钟，真实起跑落在
+        #   该分钟内的某个秒上）；若显式给了秒则原样尊重。
+        ss = int(parts[2]) if len(parts) > 2 else random.randint(0, 59)
+        ts = time.mktime((y, m, d, hh, mm, ss, 0, 0, -1))
         if ts > latest:
             # 用户给的时刻在未来或会导致越界 → 就近夹到最晚可行时刻
             ts = latest
@@ -345,7 +349,9 @@ def _fmt_start(offset_days: int = 0, at: str = None,
             lo, hi = earliest, latest
         ts = random.uniform(lo, hi)
 
-    return time.strftime("%Y-%m-%d %H:%M:00", time.localtime(ts))
+    # ★ 秒位保留（原为 ":00" 硬写）：ts 本身是带随机秒的浮点时间戳，
+    #   抹掉秒会让起跑时间永远是 07:00:00 这种整分整秒，一眼看出是造的。
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 def plan_schedule(offset_days: int, per_day: int, duration_s: int,
@@ -354,7 +360,7 @@ def plan_schedule(offset_days: int, per_day: int, duration_s: int,
 
     per_day : 该天要跑几条（上限 MAX_PER_DAY）
     times   : 用户显式指定的时刻列表 ["07:00","19:30"]，优先级最高
-    返回：["YYYY-MM-DD HH:MM:00", ...]
+    返回：["YYYY-MM-DD HH:MM:SS", ...]
     """
     per_day = max(0, min(per_day, MAX_PER_DAY))
     if per_day == 0:
@@ -386,7 +392,7 @@ def plan_schedule(offset_days: int, per_day: int, duration_s: int,
             end_limit = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
                                      VALID_END_H, 0, 0, 0, 0, -1)) - duration_s
             if nt <= end_limit:
-                out[1] = time.strftime("%Y-%m-%d %H:%M:00", time.localtime(nt))
+                out[1] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(nt))
             else:
                 # 排不下就砍掉第二条
                 out = out[:1]
