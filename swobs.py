@@ -198,6 +198,11 @@ def build_laps(points: list, start_ms: int) -> list:
       间隔：实测第 1 圈 1013.4m 而时间只到该采样点 —— 分段配速因此系统性
       偏慢约 1.3%（显示 5'40" 而真值 5'37"），用户看到的「分段/实时配速对不上」。
       真机是 1Hz 采样所以偏差可忽略；采样稀疏时必须插值。
+
+    ★★ 圈时长按【累计取整再差分】(2026-09-24 二次修复)
+      旧实现每圈各自 `int(round(lap_t))`，小数秒被独立四舍五入、误差累积：
+      150 条样本中 20% 出现「圈用时和 = totalTime ± 1 秒」。
+      现保证 Σduration == totalTime，且末圈 cumulativeDuration == totalTime。
     """
     laps = []
     if len(points) < 2:
@@ -253,30 +258,46 @@ def build_laps(points: list, start_ms: int) -> list:
         bounds.append([k * 1000.0, min((k + 1) * 1000.0, total_d)])
         k += 1
     tail = total_d - k * 1000.0
-    if tail >= 1.0:
-        bounds.append([k * 1000.0, total_d])
-    elif tail > 0 and bounds:
-        # ★ 残尾不足 1m 时【并入上一圈】而不是单列一圈：
-        #   闭环标定残差会让 total_d 落在 2000.000031 / 2000.72 这种值上，
-        #   单列会造出 3cm 的 0 长度空圈（段时 1s、配速 16'40"），
-        #   或者让"段距和"比总距少 0.72m（两者都一眼看出是造的）。
-        bounds[-1][1] = total_d
+    if tail > 0 and bounds:
+        # ★ 残尾【并入上一圈】而不是单列一圈，两个理由：
+        #   ① 距离：闭环标定残差会让 total_d 落在 2000.000031 / 2000.72 这种值上，
+        #      单列会造出 3cm 的 0 长度空圈（段时 1s、配速 16'40"），
+        #      或让「段距和」比总距少 0.72m（两者都一眼看出是造的）。
+        #   ② 时间：残尾太短时下面的累计取整会算出 duration=0 的空圈。
+        #   所以要求「距离 ≥1m 且按当前配速至少能走 2 秒」才单列。
+        t_tail = _at(total_d)[0] - _at(k * 1000.0)[0]
+        if tail >= 1.0 and t_tail >= 2.0:
+            bounds.append([k * 1000.0, total_d])
+        else:
+            bounds[-1][1] = total_d
     if not bounds:
         bounds = [[0.0, total_d]]
 
+    # ★★ 累计取整再差分（2026-09-24 二次修复）
+    #   旧实现每圈各自 `int(round(lap_t))`，小数秒被【独立】四舍五入，误差会累积：
+    #   实测 150 条样本中 20% 出现「圈用时和 = totalTime ± 1 秒」（3km 三圈各带
+    #   0.4~0.6s 残差就会凭空多出/少掉整整 1 秒）—— 用户看到的
+    #   「每圈用时加起来跟总时长对不上」。
+    #   改成「先对累计时间取整、再相邻相减」，于是 Σduration 恒等于 totalTime，
+    #   cumulativeDuration 单调且末值精确等于总时长（与 totalTime 同源同舍入）。
+    prev_cum = 0
     for i, (d_a, d_b) in enumerate(bounds):
         t_a, e_a, s_a = _at(d_a)
         t_b, e_b, s_b = _at(d_b)
         lap_d = d_b - d_a
-        lap_t = max(1.0, t_b - t_a)
+        raw_t = t_b - t_a
+        cum = int(round(t_b))
+        lap_dur = cum - prev_cum
+        prev_cum = cum
+        lap_t = max(1.0, raw_t)      # 仅用作配速/步频/步幅的分母，不参与时长累加
         lap_steps = int(max(0.0, s_b - s_a))
         laps.append({
             "avgCadence": round_to(lap_steps / (lap_t / 60.0), 2),
             "avgPace": round_to((lap_t / 60.0) / max(lap_d / 1000.0, 0.001), 2),
             "avgStride": round_to(lap_d / max(1, lap_steps) * 100.0, 2),
-            "cumulativeDuration": int(round(t_b)),
+            "cumulativeDuration": cum,
             "distance": round_to(lap_d, 4),
-            "duration": int(round(lap_t)),
+            "duration": lap_dur,
             "elevationGain": round_to(_gain(d_a, d_b), 2),
             "endAltAbs": round_to(e_b, 2),
             "endAltRel": round_to(e_b - alt0, 2),
