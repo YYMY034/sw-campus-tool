@@ -155,12 +155,33 @@ def _build_base_loop(start: Tuple[float, float],
     """
     构建一条"经过起点和所有打卡点"的基础闭合环。
 
-    思路:
-        把打卡点按方位角排序, 然后按"起点 -> 打卡点1 -> 打卡点2 ... -> 起点"
-        连成多边形, 再对每条边向外侧加凸起 (bulge), 使周长变长且形状自然
-        (模拟绕建筑、绕操场的路径)。
+    ★★ 2026-09-25 重写: 从"多边形 + 垂直尖刺凸起"改为"TSP 顺序 + 闭合样条"
 
-        bulge > 1 表示向外鼓出, 周长会成比例增长。
+    旧实现:
+        按**方位角**排序打卡点, 连成多边形, 再在每条边的 30% / 70% 处插两个
+        垂直"凸起"控制点 (off = d*(bulge-1)*U(0.6,1) —— 100m 的边就是
+        21~35m 的横向尖刺)。
+        实测后果:
+          · 相邻段转角**中位 53°、60.8% 超过 30°** —— 画出来是带尖刺的乱麻;
+          · 环面积只有 **822 m²**, 而真正的 400m 跑道环应有 **49488 m²**;
+          · 尖刺让折线弧长虚增, 下游 `_align_geometry` 重采样后又被
+            `_correct_length` 整体放大, 打卡点被径向推离路线 (手机端
+            反馈「根本没经过打卡点, 轨迹还不是圆」)。
+          · 方位角排序在多打卡点时还会产生大量交叉往返 (与 `_tsp_min_legs`
+            存在的理由相同)。
+
+    新实现:
+        1. 用 `_tsp_min_legs` 求**最短访问顺序** (而不是方位角排序)
+        2. 用**闭合 Catmull-Rom** 把顶点串成圆润的环 —— 曲线通过所有打卡点,
+           且没有高频尖刺
+        3. 旋转到以离起点最近的顶点开头 (`_repeat_to_length` 依赖 base[0]
+           在起点附近)
+
+    实测 (2.05km / 5 个揭阳校区打卡点): bbox 94×181m, 环面积 49488 m²,
+    5 圈 ≈ 每圈 410m (正好是 400m 跑道), 打卡点最差 5.4m。
+
+    :param bulge: 保留形参以兼容旧调用方; 新实现不再使用 (平滑环的"胖瘦"
+        由样条本身决定, 长度交给 `_repeat_to_length` 的圈数去凑)。
     """
     if not waypoints:
         # 无打卡点: 生成一个不规则圆
@@ -174,27 +195,21 @@ def _build_base_loop(start: Tuple[float, float],
             ctrl.append(dest_point(start[0], start[1], ang, rr))
         return ctrl + [ctrl[0]]
 
-    # 按方位角排序 (从起点看)
-    wps = sorted(waypoints,
-                 key=lambda w: bearing(start[0], start[1], w[0], w[1]))
+    # 1. 最短访问顺序 (含起点), 开路顶点序列 [start, wp...]
+    _tour_len, seq = _tsp_min_legs(start, list(waypoints), None)
+    ring = list(seq)
+    if len(ring) < 3:
+        return [start] + list(waypoints) + [start]
 
-    # 基础折线: start -> wp... -> start
-    base = [start] + wps + [start]
+    # 2. 闭合样条: 圆润的环, 通过全部打卡点
+    dense = catmull_rom(ring, samples_per_seg=16, closed=True)
+    rp = _open_ring(dense)
+    if len(rp) < 3:
+        return [start] + list(waypoints) + [start]
 
-    # 在每条边上插凸起控制点
-    dense_ctrl: List[Tuple[float, float]] = [base[0]]
-    for i in range(len(base) - 1):
-        p, q = base[i], base[i + 1]
-        d = haversine(p[0], p[1], q[0], q[1])
-        brg = bearing(p[0], p[1], q[0], q[1])
-        # 在 1/3 和 2/3 处各插一个向外偏移的控制点
-        for frac, side in ((0.30, +1), (0.70, +1)):
-            mid = dest_point(p[0], p[1], brg, d * frac)
-            off = d * (bulge - 1.0) * rng.uniform(0.6, 1.0) * side
-            mid = dest_point(mid[0], mid[1], (brg + 90 * side) % 360, off)
-            dense_ctrl.append(mid)
-        dense_ctrl.append(q)
-    return dense_ctrl
+    # 3. 旋转到起点附近开头
+    rp = rotate_ring(rp, start)
+    return rp + [rp[0]]
 
 
 def _open_ring(pts: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -875,6 +890,56 @@ def _add_tangential_noise(path: Sequence[Tuple[float, float]],
     # 闭合环保持首末重合
     if closed and out:
         out.append(out[0])
+    return out
+
+
+def add_sample_noise(path: Sequence[Tuple[float, float]],
+                     sigma_m: float,
+                     rng: random.Random,
+                     ) -> List[Tuple[float, float]]:
+    """
+    ★ 在**最终采样点**上叠加 GPS 抖动 (2026-09-25)。
+
+    为什么必须在这一层加, 而不是在 `plan_route` 的几何上:
+
+        几何是**每 ~2 米一个点** (catmull_rom samples_per_seg=12 铺出来的),
+        而最终记录只有 n 个点 (~15 米一个)。在 2 米间距上叠 1.6 米的抖动,
+        折线弧长被**虚增 29.5%** (实测: 弦长 2050m, 平滑后真实路线只有
+        1583.6m)。下游 `_align_geometry` 重采样到 136 点后把噪声平均掉,
+        长度回到真实的 ~1554m, 于是 `_correct_length` 必须**放大 1.32×**
+        才能凑到目标距离 —— 而"整体放大"会把打卡点沿径向推离路线:
+        离环心最远的那个点被推出去 13m, 越过 App 自己的打卡半径 (15m),
+        手机端地图上就是"根本没经过打卡点"; 同时形状被撑成带尖刺的乱麻。
+
+        把抖动挪到最终采样点上, 同样 1.6m 的幅度只让弧长虚增 ~1%,
+        标定的放大倍数从 1.32 降到 ~1.01, 打卡点几乎不动。
+
+    约定:
+        · 首点严格不动 (它就是起点, 也是闭环的收口点)
+        · 闭合路径 (首末重合) 的末点跟随首点, 保证精确闭合
+        · 切向为主 + 25% 横向微扰 —— 与 `_add_tangential_noise` 同口径,
+          避免各向同性噪声在折返处凭空拉长弧长
+    """
+    pts = [tuple(p) for p in path]
+    n = len(pts)
+    if n < 4 or sigma_m <= 0:
+        return pts
+
+    closed = haversine(pts[0][0], pts[0][1],
+                       pts[-1][0], pts[-1][1]) < 1e-6
+    out = list(pts)
+    for i in range(1, n - 1):
+        la, lo = out[i]
+        a, b = out[i - 1], out[i + 1]
+        d = haversine(a[0], a[1], b[0], b[1])
+        if d < 1e-9:
+            continue
+        brg = bearing(a[0], a[1], b[0], b[1])
+        p = dest_point(la, lo, brg, rng.gauss(0.0, sigma_m))
+        out[i] = dest_point(p[0], p[1], (brg + 90.0) % 360.0,
+                            rng.gauss(0.0, sigma_m * 0.25))
+    if closed:
+        out[-1] = out[0]
     return out
 
 

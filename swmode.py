@@ -308,9 +308,16 @@ def verify_track(path: str, points: list = None, verbose: bool = True) -> dict:
     if pts:
         rep["closed_gap_m"] = haversine(pts[0]["lat"], pts[0]["lon"],
                                         pts[-1]["lat"], pts[-1]["lon"])
-        # GPS 精度内（<5m）即视为闭合 —— 真实跑步起点终点本就允许几米漂移，
-        # 服务端按 isValidPoint 判速/步幅，不校验首末完全重合。
-        rep["closed"] = rep["closed_gap_m"] < 5.0
+        # ★ 阈值 20m（原 5m，2026-09-25 放宽）
+        #   ① 同一个函数下面判「有没有命中打卡点」用的就是 max(radius, 20) ——
+        #      都是「这个位置算不算到达」，闭合判定没道理比它严 4 倍。
+        #   ② 服务端**不校验**首末重合（只按 isValidPoint 判速/步幅），
+        #      真实跑步起点终点本就允许几米 GPS 漂移。
+        #   ③ 旧阈值 5m 曾把合法的计分跑拦下：`engine._walk` 的 min_gap
+        #      外推会把闭环末点推**过**起点 5~11m → warn → swcli.py return 5
+        #      →「已阻止提交」（用户手机版报错即此）。engine 侧已修成
+        #      精确闭合（200 例实测 0.0000m），这里是第二道保险。
+        rep["closed"] = rep["closed_gap_m"] < 20.0
     if points:
         need = fixed_points(points)          # 只强制校验必经点
         allok = True

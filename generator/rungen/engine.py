@@ -26,7 +26,8 @@ from .core import (
     haversine, bearing, dest_point, add_gps_noise, fmt_pace, fmt_duration,
     DEFAULT_SAMPLE_INTERVAL, IVP_W2, IVP_W3, IVP_W4, IVP_W5,
 )
-from .route import RouteMode, plan_route, nearest_index, min_tour_length
+from .route import (RouteMode, plan_route, nearest_index, min_tour_length,
+                    add_sample_noise)
 
 
 class RunningGenerator:
@@ -273,17 +274,45 @@ class RunningGenerator:
 
         # --- 路线几何 ---
         waypoints = [(c.lat, c.lon) for c in self.checkpoints]
+        # ★★ GPS 抖动**不在这里加** (2026-09-25 修复)
+        #    `plan_route` 的几何是每 ~2 米一个点, 在这上面叠 1.6m 抖动会把
+        #    折线弧长虚增 **29.5%** (实测弦长 2050m / 平滑后真实 1583.6m)。
+        #    下游 `_align_geometry` 重采样到 n 点 (~15m 间距) 会把抖动平均掉,
+        #    长度回到真实的 ~1554m, 于是 `_correct_length` 只好**放大 1.32×**
+        #    去凑目标距离 —— 整体放大把打卡点沿径向推离路线 (离环心最远的
+        #    那个被推出去 13m, 越过 App 的 15m 打卡半径 → 手机端地图显示
+        #    "根本没经过打卡点"), 形状也被撑成带尖刺的乱麻。
+        #    抖动改在 `_align_geometry` **之后**加 (见下), 幅度不变而弧长
+        #    只虚增 ~1%, 标定倍数回到 ~1.01, 打卡点几乎不动。
         coords, self.laps = plan_route(self.start, waypoints, self.distance_m,
                                        mode=self.mode, end=self.end, rng=rng,
-                                       noise_sigma_m=self.noise_sigma_m)
+                                       noise_sigma_m=0.0)
 
         # 几何点数与采样点数对齐: 将几何按弧长重采样到 n 点
         coords = self._align_geometry(coords, n, speeds)
+
+        # ★ 在最终采样点上叠加 GPS 抖动 (切向为主 + 25% 横向微扰)
+        #   首点不动; 闭环的末点跟随首点, 闭合精度不受影响。
+        coords = add_sample_noise(coords, self.noise_sigma_m, rng)
 
         # ★ 重采样必然"削掉"高曲率路段的弧长 (折返/多圈路线实测损失 4~11%,
         #   因为密集的折返点被抽样跳过了)。这里把对齐后的折线**整体缩放**
         #   回目标长度, 首末点保持不动 —— 这一步之后总距离就精确了。
         coords = self._correct_length(coords, self.distance_m)
+
+        # ★★ 闭环末段"假尖峰"治理 —— 必须挪到标定**之前** (2026-09-25 修复)
+        #    闭环要求末点严格回到起点, 于是 "几何总长 /(n-1)" 除不尽的
+        #    残差全部堆在**最后一段**上: 实测末段 27.7m 而中位 15.3m,
+        #    _walk 据此算出 5.54 m/s 的假瞬时速度 (真值 3.03), 步幅被
+        #    顶到 189cm —— 单点异常污染整份记录。
+        #    做法: 把末段的超出部分按权重摊到前面若干个点上 (末点不动),
+        #    使各段间距趋于均匀。
+        #    ★ 原先它在下面的闭环标定**之后**执行, 于是它带来的长度变化
+        #      完全逃过了标定 —— 实测标定已收敛到 err ≤0.2%, 但摊平之后
+        #      又偏出 -6.3m (0.31%), 2.00km 的请求会掉到服务端 2000m 下限
+        #      以下。放到标定之前, 这一步的长度影响就会被标定一起收掉。
+        if self.mode == RouteMode.LOOP and len(coords) >= 6:
+            coords = self._flatten_tail_segment(coords)
 
         # --- 逐点推演 ---
         # ★★ _walk 会因 min_gap 抬升而**系统性偏长** (2026-09 修复)
@@ -294,15 +323,28 @@ class RunningGenerator:
         #    情况下 (240s/km 快配速 + 密集折返) 能到 +6.2%。
         #    做法: 用 _walk 的实际输出做闭环标定 —— 量出偏长比例, 把
         #    coords 的目标长反向下调 `distance_m / k`, 再走一遍, 迭代
-        #    几次即收敛到 <0.3%。
+        #    几次即收敛到 <0.2%。
         points, cum = self._walk(coords, speeds, n)
         if not points:
             raise RuntimeError("未生成任何轨迹点")
-        for _ in range(5):
+        # ★ 迭代上限 8 (原 5)：摊平末段并入标定后收敛稍慢, 留足余量,
+        #   让距离偏差稳在 verify_pkg 的 ±5m 门槛内。
+        for _ in range(8):
             if cum <= 1e-6:
                 break
-            err = (cum - self.distance_m) / self.distance_m
-            if abs(err) <= 0.002:
+            # ★★ 收敛判据必须用**绝对偏差**, 不能用相对偏差 (2026-09-25 修复)
+            #   原来 `abs(err) <= 0.002` 是 0.2% —— 5km 上等于 **10m**,
+            #   2km 上也有 4m。而 `_walk` 的 min_gap 抬升会带来 0.6m 级的
+            #   系统性偏长 (几何 5000.0000 走出 5000.6329, 3 个点被抬升),
+            #   完全落在 0.2% 阈值**之内**, 于是标定循环**一轮都不跑**就退出,
+            #   零头全堆到末圈上 —— verify_pkg A5/C5 实测末圈 1000.63m
+            #   (要求 1000±0.5m)。旧实现之所以看不出这个洞, 只是因为它的
+            #   初始 _walk 恰好没有抬升点、偏差本来就是 0。
+            #   区间取 [-1e-6, +0.5]:
+            #     · 下界不许欠长 —— unid 3305 单次下限 2000m, 欠长会被服务端拒;
+            #     · 上界 0.5m 以内, 保证末圈不会超出 1000±0.5m 的容差。
+            dev = cum - self.distance_m
+            if -1e-6 <= dev <= 0.5:
                 break
             # 下一轮的几何目标长: 当前几何长 × (目标/实测)
             cur_geo = sum(haversine(coords[i - 1][0], coords[i - 1][1],
@@ -310,19 +352,6 @@ class RunningGenerator:
                           for i in range(1, len(coords)))
             nxt = cur_geo * (self.distance_m / cum)
             coords = self._correct_length(coords, max(1.0, nxt))
-            points, cum = self._walk(coords, speeds, n)
-            if not points:
-                raise RuntimeError("未生成任何轨迹点")
-
-        # ★★ 闭环末段"假尖峰"治理 (2026-09 修复)
-        #    闭环要求末点严格回到起点, 于是 "几何总长 /(n-1)" 除不尽的
-        #    残差全部堆在**最后一段**上: 实测末段 27.7m 而中位 15.3m,
-        #    _walk 据此算出 5.54 m/s 的假瞬时速度 (真值 3.03), 步幅被
-        #    顶到 189cm —— 单点异常污染整份记录。
-        #    做法: 把末段的超出部分按权重摊到前面若干个点上 (末点不动),
-        #    使各段间距趋于均匀, 总长几乎不变。
-        if self.mode == RouteMode.LOOP and len(coords) >= 6:
-            coords = self._flatten_tail_segment(coords)
             points, cum = self._walk(coords, speeds, n)
             if not points:
                 raise RuntimeError("未生成任何轨迹点")
@@ -610,18 +639,29 @@ class RunningGenerator:
         #   末点被钉在几何末端, 于是 roundoff 残差全部堆在最后一步上
         #   (实测末段 28.8m, 而中位 15.8m) —— _walk 会据此算出 5.8m/s
         #   的假瞬时速度, 步幅被顶到 195cm。
-        #   做法: 把最后 K 步的进度重新线性插值, 使步长与中位数对齐。
+        #   做法: 把最后 K 步的进度重新分配, 使步长与中位数对齐。
+        # ★★ 必须**按各自的 v*step 权重**分配, 不能一律均分 (2026-09-25 修复)
+        #   均分会让「1.26 秒的小步」和「5 秒的步」分到**同样长**的弧长,
+        #   于是 `_walk` 算出的 seg/step 在那些小步上炸开 —— 实测
+        #      chord 14.25m / step 1.26s = 11.34 m/s (全程均速才 2.1 m/s),
+        #   整份记录被一个点污染 (步幅/心率/最低得分都跟着失真)。
+        #   按权重分配后, 尾部各点的 seg/step 仍 ≈ 速度曲线值。
         if n > 8:
             step_med = sorted(prog[i] - prog[i - 1]
                               for i in range(1, n))[(n - 1) // 2]
             k = min(8, n - 2)
             last_gap = prog[-1] - prog[-2]
             if step_med > 1e-12 and last_gap > step_med * 1.25:
-                # 把 [prog[n-1-k], 1.0] 均分成 k 步
-                start_p = prog[-1] - k * step_med
-                start_p = max(prog[-1 - k], start_p)
-                for j in range(k + 1):
-                    prog[n - 1 - k + j] = start_p + (1.0 - start_p) * (j / k)
+                i0 = n - 1 - k                       # 首个待重排的**步**索引
+                span = 1.0 - prog[i0]
+                w = [speeds[i] * _st[i] for i in range(i0, n - 1)]
+                wsum = sum(w)
+                if wsum > 0:
+                    acc = prog[i0]
+                    for j in range(k):
+                        acc += span * w[j] / wsum
+                        prog[i0 + j + 1] = acc
+                    prog[-1] = 1.0
 
         out = []
         j = 0
@@ -717,8 +757,10 @@ class RunningGenerator:
             total_s = self._target_dur()
         steps = self._get_steps(n, total_s)
 
+        prev_pushed = False     # 上一点是否被 min_gap 外推过（间距会失真）
         for i in range(n):
             la, lo = coords[i]
+            low_gap = False
             pushed = False
 
             if i == 0:
@@ -735,7 +777,21 @@ class RunningGenerator:
                 # ★ 用【本点真实步长】而非标称 dt：步长不规则后（1~8s），
                 #   按 dt 算的 min_gap 会在 1 秒的小步上放行过短的几何间距。
                 min_gap = max(0.4, speeds[i] * step * 0.55)
-                if seg < min_gap:
+                low_gap = seg < min_gap
+                # ★★ 闭环末点是**硬锚点**，绝不允许外推 (2026-09-25 修复)
+                #   闭环的末点就是起点，是几何上钉死的约束；而末段是绕过
+                #   收口拐角的**弦**，实测只有 1.6~2.2m（中位 15.7m）——
+                #   一旦落进 min_gap 判定就会被沿朝向外推到 min_gap 处，
+                #   于是末点**越过起点** `min_gap - seg`：
+                #       min_gap = max(0.4, speeds[i]*step*0.55)
+                #       步长最高 8s、速度 ~3 m/s → min_gap 可达 ~13m
+                #   实测 5 配速 × 40 种子共 200 例中 15~17% 中招，
+                #   闭合缝 5.2~11.0m，超过 swmode.verify_track 的 5m 阈值
+                #   → warn → swcli.py return 5 阻止提交（用户线上报错即此）。
+                #   位置保持不动，速度改由曲线决定（见下方 low_gap 分支），
+                #   因此**不会**在末尾挖出一个假低速点。
+                anchor = (i == n - 1 and self.mode == RouteMode.LOOP)
+                if low_gap and not anchor:
                     brg = (bearing(prev_la, prev_lo, la, lo)
                            if seg > 1e-9 else self.rng.uniform(0, 360))
                     la, lo = dest_point(prev_la, prev_lo, brg, min_gap)
@@ -746,16 +802,35 @@ class RunningGenerator:
             elapsed += step
             ts = int((t0 + timedelta(seconds=elapsed)).timestamp() * 1000)
 
-            # ★ 速度口径：被 min_gap 抬升过的点不能再用 seg/step ——
-            #   那时 seg 恰好等于 min_gap = speeds[i]*step*0.55，于是
-            #   seg/step 恒等于 **0.55 × 目标速度**，在配速曲线上挖出一个
-            #   假低谷。按上面的设计意图（间距与速度解耦）直接取速度曲线值。
+            # ★ 速度口径：间距**不可靠**时不能再用 seg/step ——
+            #   ① 被 min_gap 抬升过的点：seg 恰好等于 min_gap =
+            #      speeds[i]*step*0.55，seg/step 恒为 0.55×目标速度；
+            #   ② 闭环末锚点：间距是绕过拐角的弦（可能只有 1~2m），
+            #      seg/step 会掉到 0.4 m/s 级；
+            #   ③ 上一点被抬升过：本段 seg 是拿「被挪过的 prev」量出来的，
+            #      已失真（上一点被外推 min_gap 后，本段 seg 会变成
+            #      min_gap + 几何间距，实测造出 11.3 m/s 的假瞬时速度，
+            #      而全程均速才 2.7 m/s）。
+            #   三者都会在配速曲线上挖出假峰/假谷。按上面的设计意图
+            #   （间距与速度解耦）直接取速度曲线值。
+            #   ★ 只改速度、**不动位置** —— 位置一变, 闭环标定会失稳。
             if i == 0 or step <= 0:
                 spd = speeds[0]
-            elif pushed:
+            elif low_gap or prev_pushed:
                 spd = speeds[i]
             else:
                 spd = seg / step
+                # ★★ 间距被 GPS 抖动污染时, seg/step 同样不可信 (2026-09-25)
+                #   几何间距是**按 speeds[i-1]*step 分配**的 (见 _align_geometry),
+                #   所以 seg/step 本就该 ≈ 速度曲线值。采样点抖动 σ=1.6m
+                #   叠在 1~2 秒的小步上时 (间距只有 3~6m), seg 被放大/缩小
+                #   40% 以上 —— 实测 seg/step 炸到 **10.09 m/s** 的假瞬时
+                #   速度 (全程均速才 3.1 m/s), 步幅跟着失真。
+                #   偏离曲线太远就说明间距不可信, 直接取速度曲线值 ——
+                #   与 low_gap / prev_pushed 完全同一口径。
+                ref = speeds[i - 1]
+                if ref > 1e-9 and not (0.65 * ref <= spd <= 1.45 * ref):
+                    spd = speeds[i]
 
             points.append(GeoPoint(
                 lat=la, lon=lo, ts_ms=ts, ele=0.0,
@@ -763,6 +838,7 @@ class RunningGenerator:
                 dist_from_start=cum, seg_m=seg,
             ))
             prev_la, prev_lo = la, lo
+            prev_pushed = pushed
 
         return points, cum
 
