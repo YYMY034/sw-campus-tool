@@ -53,27 +53,72 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 # ══════════════════════════════════════════════════════════════════
 # 打卡点：拉取 + 缓存 + 可达性
 # ══════════════════════════════════════════════════════════════════
-def load_cache(force: bool = False, anchor=None):
-    """读取打卡点缓存；anchor=(lat,lon) 用于校验缓存锚点与当前校区一致。
+def _cache_is_credible(points: list, anchor=None) -> bool:
+    """缓存里的点位是否**可信**：非空，且（给定锚点时）每个点位都在可达半径内。
 
-    若 anchor 与缓存记录的锚点不一致（换校区/坐标变了），视作缓存失效，
-    强制重新拉取，避免用错学校的打卡点。
+    ★ 为什么必须查「点位离锚点多远」（2026-09-26 审计）：
+      旧实现只比对缓存里的 `anchor` 字段，**不看点位本身在哪**。实测
+      `points_cache.json` 里那 5 个点位在**北京**（距揭阳校区 **1883 km**），
+      而 `anchor` 字段写的是揭阳 —— 按「锚点一致即有效」它们算"有效缓存"。
+      一旦被用上就会在 1883 km 外造出一条轨迹（比坐标系那个 1194 m 的
+      bug 严重 1500 倍）。
+      ★ 判据与 `reachability()` 同源（`REACHABLE_KM`）：**不可达的点位对计分跑
+      本来就没用**（上层会拦），所以「离锚点超过可达半径」直接判不可信。
     """
-    if force or not os.path.exists(POINTS_CACHE):
+    if not points:
+        return False
+    if anchor is None:
+        return True
+    for p in points:
+        try:
+            d = haversine(float(anchor[0]), float(anchor[1]),
+                          float(p["lat"]), float(p["lon"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if d / 1000.0 > REACHABLE_KM:
+            return False
+    return True
+
+
+def load_cache(force_refresh: bool = False, anchor=None,
+               allow_stale: bool = False, verbose: bool = False):
+    """读取打卡点缓存。
+
+    ★ 2026-09-26 拆参数：原来只有一个 `force`，却被两处用出了**相反**的意思 ——
+      `get_points` 开头传 `force`（用户 `--force-points`）想「强制重拉」，
+      而限流兜底传 `force=True` 想「忽略过期、回退到旧缓存」；
+      实现里 `force=True → return None`，于是**限流兜底恒拿到 None**，
+      「限流时用缓存」这句注释是**死代码**。现在拆成两个明确的参数：
+
+        force_refresh=True —— 强制重拉，**不使用**缓存（`--force-points` 用）
+        allow_stale=True   —— 允许使用**已过期**的缓存（限流兜底用）
+
+    两种模式都必须通过 `_cache_is_credible`（锚点一致 + 点位在可达半径内）。
+    不可信的缓存一律返回 None —— **宁可不跑，也别跑错地方**。
+    """
+    if force_refresh or not os.path.exists(POINTS_CACHE):
         return None
     try:
         obj = json.load(open(POINTS_CACHE, encoding="utf-8"))
     except Exception:
         return None
-    if time.time() - float(obj.get("_ts", 0)) > POINTS_CACHE_TTL:
+    if time.time() - float(obj.get("_ts", 0)) > POINTS_CACHE_TTL and not allow_stale:
         return None
     if anchor is not None:
         ca = obj.get("anchor")
         if ca is None or (abs(float(ca[0]) - float(anchor[0])) > 1e-5 or
                           abs(float(ca[1]) - float(anchor[1])) > 1e-5):
-            # 缓存锚点与当前校区不一致 → 缓存作废
+            # 缓存锚点与当前校区不一致 → 缓存作废（换校区/坐标变了）
+            if verbose:
+                print("  [cache] 缓存锚点与当前校区不一致，已忽略")
             return None
-    return obj.get("points") or []
+    pts = obj.get("points") or []
+    if not _cache_is_credible(pts, anchor):
+        if verbose:
+            print("  [cache] 缓存不可信（点位距锚点超出 %.0fkm 或字段异常），已忽略"
+                  % REACHABLE_KM)
+        return None
+    return pts
 
 
 def save_cache(points: list, anchor=None):
@@ -90,9 +135,15 @@ def is_ratelimit(err: str) -> bool:
 
 def get_points(c, lat: float, lon: float, unid: int, *,
                force: bool = False, verbose: bool = True):
-    """返回 (points, source)。source ∈ {"cache","remote","rate-limited"}"""
+    """返回 (points, source)。source ∈ {"cache","remote","rate-limited"}
+
+    ★ 2026-09-26：`force`（用户 `--force-points`）现在明确映射为
+      `load_cache(force_refresh=...)`；限流兜底改用 `allow_stale=True` ——
+      此前它传的是 `force=True`，而 `force=True` 的语义是「别用缓存」，
+      于是「限流时回退到旧缓存」**恒拿到 None**，是一句死代码。
+    """
     anchor = (lat, lon) if (lat is not None and lon is not None) else None
-    pts = load_cache(force, anchor=anchor)
+    pts = load_cache(force_refresh=force, anchor=anchor, verbose=verbose)
     if pts:
         if verbose:
             print("  [cache] 复用打卡点缓存 %d 个（30 分钟内有效，锚点一致）" % len(pts))
@@ -106,7 +157,11 @@ def get_points(c, lat: float, lon: float, unid: int, *,
         if is_ratelimit(err):
             if verbose:
                 print("  [限流] 10603：5 分钟内最多 3 次，请稍后再试")
-            pts = load_cache(force=True, anchor=anchor)
+            # ★ 限流兜底：允许使用**过期但可信**的缓存（锚点一致 + 点位在可达半径内）
+            pts = load_cache(anchor=anchor, allow_stale=True, verbose=verbose)
+            if not pts and verbose:
+                print("  [限流] 且无可用缓存（不存在 / 锚点不符 / 点位离校区过远）"
+                      " → 本次无法生成计分跑，请 5 分钟后重试或改用 --mode free")
             return (pts or []), "rate-limited"
         return [], "error"
 
@@ -151,7 +206,15 @@ def get_points(c, lat: float, lon: float, unid: int, *,
     if dropped and verbose:
         print("  [警告] %d 个点位字段异常已跳过（解析成功 %d 个）" % (dropped, len(pts)))
     if pts:
-        save_cache(pts, anchor=anchor)
+        # ★ 只缓存**可信**的点位（2026-09-26）。服务端确实返回过远在 1883 km 外
+        #   的北京点位（09-16/09-17 那批就是），旧代码会把它写进缓存，
+        #   之后每次都被 `_cache_is_credible` 拒掉 → 白白多打一次接口（撞限流）。
+        #   干脆不写：不可达的点位对计分跑本来也没用（上层会拦）。
+        if _cache_is_credible(pts, anchor):
+            save_cache(pts, anchor=anchor)
+        elif verbose:
+            print("  [警告] 打卡点距校区超出 %.0fkm（不可达），**不写入缓存**"
+                  "（避免把错学校的点位存下来）" % REACHABLE_KM)
         if verbose:
             print("  [OK] 打卡点 %d 个（必经 %d 个）"
                   % (len(pts), sum(1 for x in pts if x["isFixed"] == 1)))
