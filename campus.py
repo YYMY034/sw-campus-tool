@@ -20,6 +20,10 @@ import os
 
 # 内置已知校区表（unid -> {name, lat, lon}）。可继续扩充。
 # 注意：这只是「已知坐标」，不是「无条件默认」；学生 school 由 user/info 动态给出。
+# ★ 本表坐标必须是 **WGS-84**：它会被直接当成生成器的圆心/自由跑中心，
+#   提交时再由 `swobs.conv_point` 做一次 WGS-84 → GCJ-02。
+#   （别跟服务端打卡点搞混 —— 打卡点的 `lat/lon` 是 **BD-09**、`glat/glon` 才是
+#     GCJ-02，见 `swmode.to_wgs_points` 与 `_gh_tools/test_crs_model.py`。）
 KNOWN_CAMPUS = {
     # 广东工业大学 揭阳校区（memory：campusName=广东工业大学 揭阳校区, campusId=3125008344）
     # ★ 坐标已按 OSM 实测边界重标定（WGS-84）：

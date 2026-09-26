@@ -159,7 +159,12 @@ def get_points(c, lat: float, lon: float, unid: int, *,
 
 
 def reachability(points: list, campus_lat: float, campus_lon: float):
-    """返回 (可达? , 最近距离km, 最远距离km)。无可达性结论时返回 None"""
+    """返回 (可达? , 最近距离km, 最远距离km)。无可达性结论时返回 None
+
+    ★ 传进来的 `points` 必须是 **WGS-84**（先过 `to_wgs_points`）：
+      校区坐标（`campus.py` / 生成器自由跑圆心）用的就是 WGS-84，
+      拿服务端 BD-09 的 `lat/lon` 直接比会把距离算歪 ~1.2 km。
+    """
     if not points:
         return None, None, None
     ds = [haversine(campus_lat, campus_lon, p["lat"], p["lon"]) / 1000.0
@@ -181,6 +186,68 @@ def route_points(points: list) -> list:
     只串必经点会让闭环退化成一个点。
     """
     return list(points) if len(points) > 1 else fixed_points(points)
+
+
+def to_wgs_points(points: list) -> list:
+    """把服务端打卡点归一化成 **WGS-84**（★ 2026-09-26 修坐标系二次偏移）。
+
+    ── 服务端到底给的是什么坐标？（用 `points_cache.json` 的 5 个点做三选一）──
+    服务端下发**两套**坐标，本地实测（残差 ≤ 0.102 m，即 6 位小数的取整误差）：
+
+        lat / lon   = **BD-09**（百度，历史遗留字段）
+        glat / glon = **GCJ-02**（高德 / 火星坐标）
+
+    对照另两种假设，残差分别是 **890 m** / **1378 m** —— 都不是巧合能解释的。
+    回归测试 `_gh_tools/test_crs_model.py` 把这套模型锁死。
+
+    ── 为什么要转 WGS ──
+    轨迹生成器按约定输出 **WGS-84**，`swobs.conv_point` 提交时再转一次
+    WGS-84 → GCJ-02 写进 `gLat/gLng`（`coorType="gcj02"`）。
+    服务端判定「有没有经过打卡点」用的就是 `gLat/gLng`(GCJ) ↔ `glat/glon`(GCJ)。
+    所以喂给生成器的必须是 **GCJ 反解出来的 WGS-84**：
+
+        WGS = gcj02_to_wgs84(glat, glon)
+
+    ★ 真机报障（「没经过 5 个打卡点 / 只是一个在校外的小圈」）的根因：
+      旧代码直接把 `lat/lon`(**BD-09**) 当 WGS 喂进去 →
+      提交后落点 `wgs84_to_gcj02(BD09)` 距真点位 **1194 m**（App 判定半径 15 m）
+      → 地图上整条轨迹落在校墙外，一个点都不经过。
+    ★ 半修陷阱：把 `lat/lon` 当 **GCJ** 反解（`gcj02_to_wgs84(lat, lon)`）
+      只修一半，提交后落点仍差 **923 m** —— 必须认准 `glat/glon` 才是 GCJ。
+
+    凡是要跟**生成器轨迹**比位置的（生成 / 校验 / 可达性）都先过这里；
+    `swsubmit.five_point_payload` 走线上原始字段，**保持原样不动**。
+    """
+    import swobs
+    out = []
+    for p in points or []:
+        q = dict(p)
+        if q.get("_crs") == "wgs84":        # 幂等：已归一化过的原样返回
+            out.append(q)
+            continue
+        try:
+            la, lo = float(p["lat"]), float(p["lon"])
+        except (KeyError, TypeError, ValueError):
+            la = lo = None
+        glat, glon = p.get("glat", p.get("gLat")), p.get("glon", p.get("gLng"))
+        try:
+            gcj = ((float(glat), float(glon))
+                   if glat is not None and glon is not None else None)
+        except (TypeError, ValueError):
+            gcj = None
+        if gcj is None:
+            if la is None:
+                out.append(q)               # 连坐标都没有，原样放行（上层会判错）
+                continue
+            # 只有 lat/lon(BD-09) 时，先 BD-09 → GCJ-02（swobs 里现成的）
+            gcj = swobs.bd09_to_gcj02(la, lo)
+        wlat, wlon = swobs.gcj02_to_wgs84(gcj[0], gcj[1])
+        q["lat"], q["lon"] = wlat, wlon
+        q["gcj_lat"], q["gcj_lon"] = gcj[0], gcj[1]   # 提交判定所用的 GCJ，留痕
+        q["bd09_lat"], q["bd09_lon"] = la, lo         # 服务端原值，留痕
+        q["_crs"] = "wgs84"
+        out.append(q)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -228,10 +295,18 @@ def gen_score_track(points: list, dist_km: float, *,
                     start: str = None, pace: str = "5:40",
                     cadence: int = 0, seed: int = 0, outdir: str = None,
                     verbose: bool = True) -> str:
-    """计分跑：把打卡点串成闭环，多圈重复至目标距离"""
-    use = route_points(points)
-    if not use:
+    """计分跑：把打卡点串成闭环，多圈重复至目标距离
+
+    ★ 喂给生成器的必须是 **WGS-84**，而服务端给的是 BD-09(`lat/lon`) +
+      GCJ-02(`glat/glon`) 两套 —— 见 `to_wgs_points`。少这一步，
+      提交后落点距真点位 **1194 m**（BD-09 直喂）或 **923 m**（把 lat/lon
+      误当 GCJ 的半修），App 地图上就是「在校外的一个小圈、不经过打卡点」。
+      （App 判定半径 **15 m**；正确链实测最差 **5.4 m**。）
+    """
+    raw = route_points(points)
+    if not raw:
         raise ValueError("计分跑需要打卡点，但点位列表为空")
+    use = to_wgs_points(raw)
     outdir = outdir or os.path.join(HERE, "generator", "output")
     anchor = use[0]
     cmd = _gen_cmd() + [
@@ -252,9 +327,12 @@ def gen_score_track(points: list, dist_km: float, *,
         cmd += ["--seed", str(seed)]
     if verbose:
         print("  [生成] 计分跑 过 %d 个打卡点 环形 %.2fkm" % (len(use), dist_km))
+        print("         坐标链：服务端 lat/lon(BD-09) + glat/glon(GCJ)"
+              " -> 喂生成器 WGS-84")
         for p in use:
-            print("         · %s (%.6f, %.6f) r=%gm%s"
-                  % (p["pointName"], p["lat"], p["lon"], p["radius"],
+            print("         · %s GCJ(%.6f, %.6f) -> WGS(%.6f, %.6f) r=%gm%s"
+                  % (p["pointName"], p.get("gcj_lat", p["lat"]),
+                     p.get("gcj_lon", p["lon"]), p["lat"], p["lon"], p["radius"],
                      "  [必经]" if p["isFixed"] == 1 else ""))
     return _run_gen(cmd, outdir, verbose)
 
@@ -299,8 +377,28 @@ def _run_gen(cmd: list, outdir: str, verbose: bool) -> str:
 # ══════════════════════════════════════════════════════════════════
 # 轨迹校验：必过打卡点 + 首末闭合
 # ══════════════════════════════════════════════════════════════════
+def _track_gcj(pts: list) -> list:
+    """轨迹点(WGS-84) → 提交链路坐标(GCJ-02)，与 `swobs.conv_point` 同一步。
+
+    只有走这一步，本地算出来的「距打卡点多远」才等于 App 地图上看到的距离。
+    """
+    import swobs
+    return [swobs.wgs84_to_gcj02(float(q["lat"]), float(q["lon"])) for q in pts]
+
+
 def verify_track(path: str, points: list = None, verbose: bool = True) -> dict:
-    """校验轨迹是否经过全部【必经点】、是否闭合。"""
+    """校验轨迹是否经过全部【必经点】、是否闭合。
+
+    ★★ 2026-09-26 修「判据与提交链路坐标系不一致」（用户真机报障的第二层根因）：
+      轨迹 JSON 里是生成器的 **WGS-84**；提交时 `swobs.conv_point` 会把它转成
+      **GCJ-02** 写进 `gLat/gLng`，服务端就是拿这组 GCJ 去比打卡点的
+      `glat/glon`(GCJ)。而旧版**在 WGS 空间里直接比 `p["lat"]/p["lon"]`(BD-09)**：
+      两边都错、恰好互相抵消，于是本地永远打印「OK 距点 6.0m」——
+      而真机上轨迹偏了 **1194 m**。**自洽的空转比没有校验更糟。**
+      现在：① 点位先 `to_wgs_points` 归一化到 WGS（用来判闭合/路线是否合理）；
+            ② **再按提交链路转成 GCJ 比一次，并以 GCJ 距离作为通过判据**。
+      两个数都打印，一旦再漂移立刻看得见。
+    """
     t = json.load(open(path, encoding="utf-8"))
     pts = t.get("points") or []
     rep = {"points": len(pts), "hits": [], "closed": False,
@@ -317,24 +415,33 @@ def verify_track(path: str, points: list = None, verbose: bool = True) -> dict:
         #      外推会把闭环末点推**过**起点 5~11m → warn → swcli.py return 5
         #      →「已阻止提交」（用户手机版报错即此）。engine 侧已修成
         #      精确闭合（200 例实测 0.0000m），这里是第二道保险。
+        #   闭合只跟轨迹形状有关，用 WGS 空间量即可（同空间，无坐标系问题）。
         rep["closed"] = rep["closed_gap_m"] < 20.0
     if points:
-        need = fixed_points(points)          # 只强制校验必经点
+        need = to_wgs_points(fixed_points(points))   # 只强制校验必经点
+        gcj_pts = _track_gcj(pts) if pts else []
         allok = True
         for p in need:
-            d = min(haversine(p["lat"], p["lon"], q["lat"], q["lon"])
-                    for q in pts) if pts else 1e9
+            d_wgs = (min(haversine(p["lat"], p["lon"], q["lat"], q["lon"])
+                         for q in pts) if pts else 1e9)
+            # ★ 判据：提交后 App/服务端看到的那组坐标
+            gla, glo = p.get("gcj_lat"), p.get("gcj_lon")
+            if gcj_pts and gla is not None:
+                d = min(haversine(gla, glo, q[0], q[1]) for q in gcj_pts)
+            else:
+                d = d_wgs
             hit = d <= max(p["radius"], 20)
             allok &= hit
             rep["hits"].append({"name": p["pointName"], "dist_m": round(d, 2),
-                                "hit": hit})
+                                "dist_wgs_m": round(d_wgs, 2), "hit": hit})
         rep["ok"] = allok and rep["closed"]
     else:
         rep["ok"] = rep["closed"]
     if verbose:
         for h in rep["hits"]:
-            print("      %s %s  距点 %.1fm"
-                  % ("OK " if h["hit"] else "MISS", h["name"], h["dist_m"]))
+            print("      %s %s  距点(GCJ提交) %.1fm   本地WGS %.1fm"
+                  % ("OK " if h["hit"] else "MISS", h["name"], h["dist_m"],
+                     h["dist_wgs_m"]))
         print("      闭合: %s (首末相距 %s m)"
               % ("是" if rep["closed"] else "否",
                  "%.1f" % rep["closed_gap_m"] if rep["closed_gap_m"] is not None else "-"))
@@ -384,7 +491,9 @@ def prepare(c, mode: str, dist_km: float, *, campus_lat: float = None,
         raise RuntimeError("未能获取打卡点（限流或接口异常），请改用 --mode free")
 
     if campus_lat is not None and campus_lon is not None:
-        ok, near, far = reachability(pts, campus_lat, campus_lon)
+        # ★ 可达性必须用 WGS-84 点位比 WGS-84 校区（服务端 lat/lon 是 BD-09，
+        #   直接比会把距离算歪 ~1.2km → 可能把真实可达的打卡点误判为不可达）
+        ok, near, far = reachability(to_wgs_points(pts), campus_lat, campus_lon)
         if verbose:
             print("  [可达性] 最近 %.2fkm 最远 %.2fkm  (阈值 %.0fkm)"
                   % (near, far, REACHABLE_KM))

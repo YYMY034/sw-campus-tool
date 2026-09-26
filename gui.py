@@ -1752,7 +1752,11 @@ async function doRun(){
     // 把当前校区坐标一并带上（后端优先使用；未登录后端会回退默认揭阳）
     const lat=(state&&state.campus_lat!=null)?state.campus_lat:null;
     const lon=(state&&state.campus_lon!=null)?state.campus_lon:null;
-    const res=await api("/api/run",{mode,dist,pace,start,device,weight,platform,lat,lon});
+    // ★「强制」复选框此前是**死控件**：后端 do_run/run_all 早就支持 force，
+    //   但这里从来不读 rForce、请求体里也没有 force 字段 —— 于是「打卡点不可达」
+    //   被拦下时，用户界面里根本没有放行入口（run_all 只提示「加 --force」）。
+    const force=!!($("rForce")&&$("rForce").checked);
+    const res=await api("/api/run",{mode,dist,pace,start,device,weight,platform,lat,lon,force});
     toast(res.ok?"提交成功":"提交被阻止/失败");
     await getState();
   }catch(e){toast("提交异常:"+e);}

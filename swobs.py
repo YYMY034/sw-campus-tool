@@ -92,6 +92,29 @@ def wgs84_to_gcj02(lat: float, lng: float):
     return lat + dlat, lng + dlng
 
 
+def gcj02_to_wgs84(lat: float, lng: float):
+    """GCJ-02 → WGS-84（迭代反解，与 wgs84_to_gcj02 互逆到 ~1e-9 度 ≈ 0.1mm）。
+
+    ★ 为什么需要它（2026-09-26 修）：
+      服务端下发的**打卡点**带两套坐标（本地实测，见 `_gh_tools/test_crs_model.py`）：
+
+          lat / lon   = **BD-09**（百度，历史遗留）
+          glat / glon = **GCJ-02**（高德）
+
+      而轨迹生成器按约定输出 **WGS-84**，`conv_point` 提交时再做一次
+      WGS-84 → GCJ-02。所以喂给生成器之前必须先把 `glat/glon`(GCJ)
+      反解成 WGS-84，让提交那一次转换正好还原。
+      （揭阳一带 GCJ↔WGS 偏移 **553.8 m**；把 BD-09 的 `lat/lon` 直喂
+       会让提交后的落点距真点位 **1194 m**，App 判定半径只有 15 m。）
+    """
+    wlat, wlng = lat, lng
+    for _ in range(6):
+        glat, glng = wgs84_to_gcj02(wlat, wlng)
+        wlat += lat - glat
+        wlng += lng - glng
+    return wlat, wlng
+
+
 # ══════════════════════════════════════════════════════════════════
 # gzip + base64
 # ══════════════════════════════════════════════════════════════════
